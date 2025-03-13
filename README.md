@@ -92,7 +92,7 @@ curl http://localhost:3000/debug \
   -H "Authorization: Bearer TOKEN"
 ```
 
-> **Note:** The TOKEN should be set to the value of `ENCRYPTION_KEY` from the `.env` file. 
+The TOKEN should be set to the value of `ENCRYPTION_KEY` from the `.env` file. 
 
 ## Links
 
