@@ -6,7 +6,7 @@ A Node.js implementation with Express server integration built on Gun.JS. Phalan
 
 - Gun.js peer-to-peer database integration
 - Express server setup
-- Rate limiting
+- Rate limiting for endpoints
 
 ## Installation
 
@@ -30,14 +30,27 @@ A Node.js implementation with Express server integration built on Gun.JS. Phalan
 
 ### Docker Setup
 
-1. Build the Docker image:
-   ```bash
-   docker build -t gunjs-client .
+1. Create a docker-compose.yml file with the following content:
+   ```yaml
+   services:
+     phalanx_db:
+       image: godver3/phalanx_db:latest
+       container_name: phalanx_db
+       restart: unless-stopped
+       ports:
+         - "3000:3000"
+       volumes:
+         - phalanx_data:/app/gun-relays
+         - phalanx_data:/app/node-data.json
+
+   volumes:
+     phalanx_data:
+       name: phalanx_data
    ```
 
-2. Run the container:
+2. Start the container:
    ```bash
-   docker run -p 8765:8765 gunjs-client
+   docker compose up -d
    ```
 
 ## API Endpoints
@@ -79,7 +92,7 @@ curl http://localhost:3000/debug \
   -H "Authorization: Bearer TOKEN"
 ```
 
-See .env file for TOKEN details.
+> **Note:** The TOKEN should be set to the value of `ENCRYPTION_KEY` from the `.env` file. 
 
 ## Links
 
