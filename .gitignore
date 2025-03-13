@@ -18,4 +18,8 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
-*.swo 
+*.swo
+
+# Gun.js specific
+gun-relays/
+node-data.json/ 
