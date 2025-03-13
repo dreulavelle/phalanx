@@ -1,0 +1,14 @@
+services:
+  phalanx_db:
+    image: godver3/phalanx_db:latest
+    container_name: phalanx_db
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - phalanx_data:/app/gun-relays
+      - phalanx_data:/app/node-data.json
+
+volumes:
+  phalanx_data:
+    name: phalanx_data 

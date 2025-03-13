@@ -48,12 +48,13 @@ All endpoints require authentication using a Bearer token. The encryption key sh
 
 ```bash
 curl -X POST http://localhost:3000/data \
-  -H "Authorization: Bearer phalanx_db_v1_32byte_key_20240312_01" \
+  -H "Authorization: Bearer TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "hash": "example_hash_123",
     "cached": true,
-    "timestamp": "2024-03-12T12:00:00Z"
+    "timestamp": "2024-03-12T12:00:00Z",
+    "provider": "real_debrid"
   }'
 ```
 
@@ -61,22 +62,24 @@ curl -X POST http://localhost:3000/data \
 
 ```bash
 curl http://localhost:3000/data \
-  -H "Authorization: Bearer phalanx_db_v1_32byte_key_20240312_01"
+  -H "Authorization: Bearer TOKEN"
 ```
 
 ### Get Specific Data by Hash
 
 ```bash
 curl http://localhost:3000/data/example_hash_123 \
-  -H "Authorization: Bearer phalanx_db_v1_32byte_key_20240312_01"
+  -H "Authorization: Bearer TOKEN"
 ```
 
 ### Debug Endpoint
 
 ```bash
 curl http://localhost:3000/debug \
-  -H "Authorization: Bearer phalanx_db_v1_32byte_key_20240312_01"
+  -H "Authorization: Bearer TOKEN"
 ```
+
+See .env file for TOKEN details.
 
 ## Links
 

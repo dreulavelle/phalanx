@@ -267,7 +267,8 @@ class GunNode {
         return {
             hash: data.hash,
             cached: data.cached,
-            timestamp: data.timestamp
+            timestamp: data.timestamp,
+            provider: data.provider || 'real_debrid' // Add provider with default value
         };
     }
 
