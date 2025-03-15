@@ -442,20 +442,40 @@ class GunNode {
         console.log('Running cache expiration check...');
         const sevenDaysAgo = new Date();
         sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+        
+        const oneDayAgo = new Date();
+        oneDayAgo.setDate(oneDayAgo.getDate() - 1);
 
         this.getAllData((allData) => {
             Object.entries(allData).forEach(([hash, entry]) => {
                 const entryDate = new Date(entry.timestamp);
-                if (entryDate < sevenDaysAgo && entry.cached) {
+                
+                // Check for cached items older than 7 days
+                if (entryDate < sevenDaysAgo && entry.cached === true) {
                     console.log(`Expiring cache for entry: ${hash} (${entry.timestamp})`);
                     this.cacheTable.get(hash).put({
-                        cached: false,
+                        cached: 'unchecked',
                         timestamp: entry.timestamp
                     }, (ack) => {
                         if (ack.err) {
                             console.error(`Error updating cache status for ${hash}:`, ack.err);
                         } else {
                             console.log(`Successfully expired cache for ${hash}`);
+                        }
+                    });
+                }
+                
+                // Check for uncached items older than 24 hours
+                if (entryDate < oneDayAgo && entry.cached === false) {
+                    console.log(`Moving uncached entry to unchecked state: ${hash} (${entry.timestamp})`);
+                    this.cacheTable.get(hash).put({
+                        cached: 'unchecked',
+                        timestamp: entry.timestamp
+                    }, (ack) => {
+                        if (ack.err) {
+                            console.error(`Error updating cache status for ${hash}:`, ack.err);
+                        } else {
+                            console.log(`Successfully moved entry to unchecked state: ${hash}`);
                         }
                     });
                 }

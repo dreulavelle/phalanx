@@ -7,6 +7,10 @@ A Node.js implementation with Express server integration built on Gun.JS. Phalan
 - Gun.js peer-to-peer database integration
 - Express server setup
 - Rate limiting for endpoints
+- Cache management:
+  - Three-state cache system: `cached`, `uncached`, and `unchecked`
+  - Automatic cache expiration after 7 days (moves from `cached` to `unchecked`)
+  - Automatic recheck trigger after 24 hours of being `uncached` (moves to `unchecked`)
 
 ## Installation
 
@@ -70,6 +74,11 @@ curl -X POST http://localhost:3000/data \
     "provider": "real_debrid"
   }'
 ```
+
+The `cached` field accepts the following values:
+- `true`: Item is confirmed to be cached
+- `false`: Item is confirmed to not be cached
+- `"unchecked"`: Item needs verification (automatically set after expiration)
 
 ### Get All Data
 
