@@ -106,10 +106,11 @@ class GunNode {
             if (!this.gun) {
                 return res.status(503).json({ error: 'Database not initialized' });
             }
-
+            console.log('Received /data request with query:', req.query);
+            
             try {
                 const result = await this.getFilteredData({
-                    limit: parseInt(req.query.limit) || 50,
+                    limit: parseInt(req.query.limit) || 50, // Increase limit to get more data for sorting
                     filter: req.query.filter || {},
                     minTimestamp: req.query.minTimestamp,
                     maxTimestamp: req.query.maxTimestamp
@@ -117,6 +118,20 @@ class GunNode {
 
                 // Clean the data before sending
                 result.data = result.data.map(entry => this.cleanData(entry));
+
+                // Sort the cleaned data by timestamp (newest first)
+                result.data.sort((a, b) => {
+                    const dateA = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+                    const dateB = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+                    return dateB - dateA;
+                });
+                
+                // Apply the limit after sorting
+                const limit = parseInt(req.query.limit) || 50;
+                result.data = result.data.slice(0, limit);
+                result.limit = limit;
+                result.total = result.data.length;
+                
                 res.json(result);
             } catch (error) {
                 console.error('Error in /data GET:', error);
@@ -388,17 +403,37 @@ class GunNode {
     // Get all data with SEA decryption
     getAllData(callback) {
         const allData = {};
+        let receivedCount = 0;
+        let lastReceived = Date.now();
+        
+        // Set a timeout to ensure we don't wait forever
+        const maxWaitTime = 3000; // 3 seconds max wait
+        const startTime = Date.now();
+        
+        // We'll consider data collection complete if no new data 
+        // has been received for 500ms, or we hit the max wait time
+        const checkComplete = () => {
+            const now = Date.now();
+            if ((now - lastReceived > 500 && receivedCount > 0) || (now - startTime > maxWaitTime)) {
+                callback(allData);
+                return true;
+            }
+            return false;
+        };
+        
+        const intervalId = setInterval(() => {
+            if (checkComplete()) {
+                clearInterval(intervalId);
+            }
+        }, 100);
         
         this.cacheTable.map().once((data, hash) => {
             if (data) {
                 allData[hash] = data;
+                receivedCount++;
+                lastReceived = Date.now();
             }
         });
-
-        // Gun.js is asynchronous, so we still need a small delay
-        setTimeout(() => {
-            callback(allData);
-        }, 2000);
     }
 
     // Set data with SEA encryption
@@ -417,16 +452,49 @@ class GunNode {
 
     // Get filtered data (simplified)
     async getFilteredData(options = {}) {
-        const { limit = 50 } = options;
+        const { limit = 50, minTimestamp, maxTimestamp, filter = {} } = options;
         
         return new Promise((resolve) => {
             this.getAllData((allData) => {
-                const entries = Object.entries(allData)
+                let entries = Object.entries(allData)
                     .map(([hash, data]) => ({
                         hash,
                         ...data
-                    }))
-                    .slice(0, limit);
+                    }));
+                
+                // Apply timestamp filters if provided
+                if (minTimestamp) {
+                    entries = entries.filter(entry => 
+                        entry.timestamp && new Date(entry.timestamp) >= new Date(minTimestamp)
+                    );
+                }
+                
+                if (maxTimestamp) {
+                    entries = entries.filter(entry => 
+                        entry.timestamp && new Date(entry.timestamp) <= new Date(maxTimestamp)
+                    );
+                }
+                
+                // Apply any additional filter properties
+                if (Object.keys(filter).length > 0) {
+                    entries = entries.filter(entry => {
+                        return Object.entries(filter).every(([key, value]) => {
+                            return entry[key] === value;
+                        });
+                    });
+                }
+                
+                // IMPORTANT: Force explicit timestamp sorting - newest first
+                entries.sort((a, b) => {
+                    // Parse timestamps to ensure consistent comparison
+                    const dateA = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+                    const dateB = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+                    // Sort descending (newest first)
+                    return dateB - dateA;
+                });
+                
+                // Apply limit after sorting
+                entries = entries.slice(0, limit);
 
                 resolve({
                     total: entries.length,
