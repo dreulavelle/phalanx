@@ -59,7 +59,7 @@ class GunNode {
         this.config = {
             isRemoteServer: config.isRemoteServer || false,
             connectToRemote: !config.isRemoteServer && (config.connectToRemote || false),
-            port: config.port || 3000,
+            port: config.port || 8888,
             peers: [] // Will be populated dynamically
         };
         this.pair = null; // Will store SEA key pair
@@ -468,7 +468,7 @@ class GunNode {
 // Parse command line arguments
 const args = process.argv.slice(2);
 const nodeType = args[0] || 'local';  // Default to local if no argument
-const port = args[1] || 3000;  // Optional port argument
+const port = args[1] || 8888;  // Optional port argument
 
 // Configure node based on type
 const config = {
