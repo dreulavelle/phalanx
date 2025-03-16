@@ -8,9 +8,11 @@ A Node.js implementation with Express server integration built on Gun.JS. Phalan
 - Express server setup
 - Rate limiting for endpoints
 - Cache management:
-  - Three-state cache system: `cached`, `uncached`, and `unchecked`
-  - Automatic cache expiration after 7 days (moves from `cached` to `unchecked`)
-  - Automatic recheck trigger after 24 hours of being `uncached` (moves to `unchecked`)
+  - Two-state cache system: `cached` and `uncached`
+  - Automatic expiry calculation when not explicitly provided:
+    - Cached items expire after 7 days from their last modification
+    - Uncached items expire after 24 hours from their last modification
+  - Cache status and expiry dates are preserved as provided
 
 ## Installation
 
@@ -68,17 +70,33 @@ curl -X POST http://localhost:3000/data \
   -H "Authorization: Bearer TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "hash": "example_hash_123",
+    "infohash": "example_hash_123",
     "cached": true,
-    "timestamp": "2024-03-12T12:00:00Z",
-    "provider": "real_debrid"
+    "service": "real_debrid",
+    "last_modified": "2024-03-12T12:00:00Z",
+    "expiry": "2024-03-19T12:00:00Z"
   }'
 ```
 
-The `cached` field accepts the following values:
-- `true`: Item is confirmed to be cached
-- `false`: Item is confirmed to not be cached
-- `"unchecked"`: Item needs verification (automatically set after expiration)
+**Data Validation Requirements:**
+- Required fields:
+  - `infohash`: must be a string
+  - `service`: must be a string
+  - `cached`: must be a boolean (true or false)
+- Optional fields:
+  - `last_modified`: if provided, must be a valid ISO 8601 timestamp with Z suffix
+  - `expiry`: if provided, must be a valid ISO 8601 timestamp with Z suffix
+- Requests missing required fields or containing invalid data types will be rejected
+
+Note: All timestamps must be in UTC format (ISO 8601) with the 'Z' suffix indicating UTC timezone (e.g., "2024-03-12T12:00:00Z")
+
+The `cached` field and expiry handling:
+- `true`: Item is cached (default expiry: 7 days from last_modified if not provided)
+- `false`: Item is not cached (default expiry: 24 hours from last_modified if not provided)
+- `last_modified` defaults to server's current time if not provided
+- The `expiry` field can be provided explicitly, otherwise defaults are calculated
+- All timestamps must be in UTC format with 'Z' suffix
+- Cache status and expiry values are preserved as provided, without automatic expiration logic
 
 ### Get All Data
 
@@ -87,7 +105,7 @@ curl http://localhost:3000/data \
   -H "Authorization: Bearer TOKEN"
 ```
 
-### Get Specific Data by Hash
+### Get Specific Data by Infohash
 
 ```bash
 curl http://localhost:3000/data/example_hash_123 \

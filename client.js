@@ -46,6 +46,20 @@ const authenticateRequest = (req, res, next) => {
 // Node identity configuration
 const NODE_ID = 'phalanx-db'; // Consistent ID for all nodes in our network
 
+// Helper function to validate ISO date format
+function isValidISODate(dateString) {
+    if (typeof dateString !== 'string') return false;
+    
+    // Check if it's an ISO 8601 format and ends with 'Z'
+    const isISOFormat = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(dateString);
+    
+    if (!isISOFormat) return false;
+    
+    // Check if it's a valid date
+    const date = new Date(dateString);
+    return !isNaN(date.getTime());
+}
+
 class GunNode {
     constructor(config = {}) {
         this.gun = null;
@@ -81,6 +95,72 @@ class GunNode {
             }
         });
         
+        // Add debug trace endpoint
+        this.app.get('/debug-trace/:key', authenticateRequest, async (req, res) => {
+            if (!this.gun) {
+                return res.status(503).json({ error: 'Database not initialized' });
+            }
+            
+            const infohash = req.params.key;
+            const trace = {};
+            
+            // Get raw data directly from Gun
+            this.cacheTable.get(infohash).once(async rawData => {
+                trace.raw = rawData;
+                
+                // Add a test object with explicit cached property
+                const testObj = {
+                    infohash: infohash + "_test",
+                    cached: true,
+                    service: "test_service",
+                    last_modified: new Date().toISOString()
+                };
+                trace.testInput = testObj;
+                
+                // Calculate expiry for test object
+                const expiryDate = new Date(testObj.last_modified);
+                expiryDate.setDate(expiryDate.getDate() + 7);
+                testObj.expiry = expiryDate.toISOString();
+                trace.testWithExpiry = {...testObj};
+                
+                // Test encryption
+                const encrypted = await this.encrypt(testObj);
+                trace.encrypted = encrypted;
+                
+                // Test decryption
+                if (encrypted && encrypted.encryptedData) {
+                    try {
+                        const decrypted = await this.decrypt(encrypted);
+                        trace.decrypted = decrypted;
+                    } catch (error) {
+                        trace.decryptionError = error.message;
+                    }
+                }
+                
+                // Get processed data
+                if (rawData) {
+                    try {
+                        let processed = null;
+                        if (rawData.encryptedData) {
+                            processed = await this.decrypt(rawData);
+                            trace.decryptedActual = processed;
+                        } else {
+                            processed = rawData;
+                            trace.decryptedActual = "Not encrypted";
+                        }
+                        
+                        // Clean the data
+                        const cleaned = this.cleanData(processed);
+                        trace.cleaned = cleaned;
+                    } catch (error) {
+                        trace.processingError = error.message;
+                    }
+                }
+                
+                res.json(trace);
+            });
+        });
+        
         // Add data endpoint (protected)
         this.app.post('/data', authenticateRequest, async (req, res) => {
             if (!this.gun) {
@@ -88,8 +168,46 @@ class GunNode {
             }
 
             const data = req.body;
+            
+            // Validate required fields
+            if (!data.infohash || !data.service || data.cached === undefined) {
+                return res.status(400).json({ 
+                    error: 'Missing required fields. infohash, service, and cached are required.'
+                });
+            }
+            
+            // Validate data types
+            if (typeof data.infohash !== 'string' || typeof data.service !== 'string') {
+                return res.status(400).json({ 
+                    error: 'Invalid data types. infohash and service must be strings.'
+                });
+            }
+            
+            if (typeof data.cached !== 'boolean') {
+                return res.status(400).json({ 
+                    error: 'Invalid data type. cached must be a boolean (true or false).'
+                });
+            }
+            
+            // Validate timestamp formats if provided
+            if (data.last_modified) {
+                if (!isValidISODate(data.last_modified)) {
+                    return res.status(400).json({ 
+                        error: 'Invalid last_modified timestamp format. Must be ISO 8601 format with Z suffix (e.g., 2024-03-12T12:00:00Z).'
+                    });
+                }
+            }
+            
+            if (data.expiry) {
+                if (!isValidISODate(data.expiry)) {
+                    return res.status(400).json({ 
+                        error: 'Invalid expiry timestamp format. Must be ISO 8601 format with Z suffix (e.g., 2024-03-12T12:00:00Z).'
+                    });
+                }
+            }
+            
             try {
-                const success = await this.setData(data.hash, data);
+                const success = await this.setData(data.infohash, data);
                 if (success) {
                     res.json({ status: 'success', message: 'Data added successfully' });
                 } else {
@@ -121,8 +239,8 @@ class GunNode {
 
                 // Sort the cleaned data by timestamp (newest first)
                 result.data.sort((a, b) => {
-                    const dateA = a.timestamp ? new Date(a.timestamp).getTime() : 0;
-                    const dateB = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+                    const dateA = a.last_modified ? new Date(a.last_modified).getTime() : 0;
+                    const dateB = b.last_modified ? new Date(b.last_modified).getTime() : 0;
                     return dateB - dateA;
                 });
                 
@@ -154,7 +272,7 @@ class GunNode {
                 this.getAllData((allData) => {
                     dataCount = Object.keys(allData).length;
                     validCount = Object.values(allData).filter(data => 
-                        data && data.timestamp && data.cached !== undefined
+                        data && data.last_modified && data.cached !== undefined
                     ).length;
                     resolve();
                 });
@@ -194,11 +312,14 @@ class GunNode {
             }
 
             this.getData(req.params.key, (data) => {
-                if (data) {
-                    res.json(this.cleanData(data));
-                } else {
-                    res.status(404).json({ error: 'Data not found' });
+                if (!data) {
+                    return res.status(404).json({ error: 'Data not found' });
                 }
+                
+                // Clean and return the data
+                const cleanedData = this.cleanData(data);
+                cleanedData.infohash = req.params.key; // Ensure infohash is included
+                res.json(cleanedData);
             });
         });
     }
@@ -279,12 +400,19 @@ class GunNode {
         if (!data || typeof data !== 'object') return data;
         
         // Create a new object with only our expected properties
-        return {
-            hash: data.hash,
-            cached: data.cached,
-            timestamp: data.timestamp,
-            provider: data.provider || 'real_debrid' // Add provider with default value
+        const cleaned = {
+            infohash: data.infohash,
+            service: data.provider || data.service || 'real_debrid',
+            last_modified: data.last_modified,
+            expiry: data.expiry || null
         };
+
+        // Explicitly preserve cached property if it exists
+        if (data.cached === true || data.cached === false) {
+            cleaned.cached = data.cached;
+        }
+
+        return cleaned;
     }
 
     // Encryption utilities using SEA
@@ -294,11 +422,8 @@ class GunNode {
                 throw new Error('Encryption not initialized');
             }
             
-            // Clean the data before encryption
-            const cleanedData = this.cleanData(data);
-            
             // Convert data to string if it's an object
-            const dataStr = typeof cleanedData === 'object' ? JSON.stringify(cleanedData) : cleanedData;
+            const dataStr = typeof data === 'object' ? JSON.stringify(data) : data;
             
             // Add retry logic for encryption
             let retries = 3;
@@ -326,7 +451,7 @@ class GunNode {
             
             return {
                 encryptedData: encrypted,
-                timestamp: new Date().toISOString()
+                last_modified: data.last_modified || new Date().toISOString()
             };
         } catch (error) {
             console.error('SEA encryption error:', error);
@@ -394,9 +519,34 @@ class GunNode {
     }
 
     // Get data with SEA decryption
-    async getData(hash, callback) {
-        this.cacheTable.get(hash).once((data) => {
-            callback(data);
+    async getData(infohash, callback) {
+        this.cacheTable.get(infohash).once(async (data) => {
+            if (!data) {
+                callback(null);
+                return;
+            }
+
+            try {
+                // Make a copy of the raw data
+                const retrievedData = JSON.parse(JSON.stringify(data));
+                
+                // Add infohash to the data
+                retrievedData.infohash = infohash;
+                
+                // Check if data exists
+                if (!retrievedData.last_modified) {
+                    console.warn(`Invalid data format for infohash: ${infohash}`);
+                    callback(null);
+                    return;
+                }
+                
+                // Clean the data before returning
+                const cleanedData = this.cleanData(retrievedData);
+                callback(cleanedData);
+            } catch (error) {
+                console.error(`Error processing data for infohash ${infohash}:`, error);
+                callback(null);
+            }
         });
     }
 
@@ -437,9 +587,45 @@ class GunNode {
     }
 
     // Set data with SEA encryption
-    async setData(hash, data) {
+    async setData(infohash, data) {
+        // Create a new data object with direct property assignment
+        const processedData = {
+            infohash: infohash,
+            service: data.provider || data.service || 'real_debrid',
+            last_modified: data.last_modified || new Date().toISOString()
+        };
+        
+        // Directly preserve cached without logic
+        if (data.cached === true) {
+            processedData.cached = true;
+        } else if (data.cached === false) {
+            processedData.cached = false;
+        }
+        
+        // Handle timestamp formatting
+        if (!processedData.last_modified.endsWith('Z')) {
+            processedData.last_modified = new Date(processedData.last_modified).toISOString();
+        }
+        
+        // Directly use expiry if provided, otherwise calculate based on cached
+        if (data.expiry) {
+            processedData.expiry = data.expiry.endsWith('Z') 
+                ? data.expiry 
+                : new Date(data.expiry).toISOString();
+        } else if (processedData.cached === true) {
+            // Only calculate if not provided
+            const expiryDate = new Date(processedData.last_modified);
+            expiryDate.setDate(expiryDate.getDate() + 7); // 7 days for cached=true
+            processedData.expiry = expiryDate.toISOString();
+        } else if (processedData.cached === false) {
+            // Only calculate if not provided
+            const expiryDate = new Date(processedData.last_modified);
+            expiryDate.setHours(expiryDate.getHours() + 24); // 24 hours for cached=false
+            processedData.expiry = expiryDate.toISOString();
+        }
+
         return new Promise((resolve) => {
-            this.cacheTable.get(hash).put(data, (ack) => {
+            this.cacheTable.get(infohash).put(processedData, (ack) => {
                 if (ack.err) {
                     console.error('Error storing data:', ack.err);
                     resolve(false);
@@ -458,20 +644,20 @@ class GunNode {
             this.getAllData((allData) => {
                 let entries = Object.entries(allData)
                     .map(([hash, data]) => ({
-                        hash,
-                        ...data
+                        infohash: hash,
+                        ...this.cleanData(data)
                     }));
                 
                 // Apply timestamp filters if provided
                 if (minTimestamp) {
                     entries = entries.filter(entry => 
-                        entry.timestamp && new Date(entry.timestamp) >= new Date(minTimestamp)
+                        entry.last_modified && new Date(entry.last_modified) >= new Date(minTimestamp)
                     );
                 }
                 
                 if (maxTimestamp) {
                     entries = entries.filter(entry => 
-                        entry.timestamp && new Date(entry.timestamp) <= new Date(maxTimestamp)
+                        entry.last_modified && new Date(entry.last_modified) <= new Date(maxTimestamp)
                     );
                 }
                 
@@ -484,11 +670,11 @@ class GunNode {
                     });
                 }
                 
-                // IMPORTANT: Force explicit timestamp sorting - newest first
+                // IMPORTANT: Force explicit last_modified sorting - newest first
                 entries.sort((a, b) => {
                     // Parse timestamps to ensure consistent comparison
-                    const dateA = a.timestamp ? new Date(a.timestamp).getTime() : 0;
-                    const dateB = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+                    const dateA = a.last_modified ? new Date(a.last_modified).getTime() : 0;
+                    const dateB = b.last_modified ? new Date(b.last_modified).getTime() : 0;
                     // Sort descending (newest first)
                     return dateB - dateA;
                 });
@@ -504,53 +690,6 @@ class GunNode {
             });
         });
     }
-
-    // Check and update cache status for items older than 7 days
-    checkCacheExpiration() {
-        console.log('Running cache expiration check...');
-        const sevenDaysAgo = new Date();
-        sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-        
-        const oneDayAgo = new Date();
-        oneDayAgo.setDate(oneDayAgo.getDate() - 1);
-
-        this.getAllData((allData) => {
-            Object.entries(allData).forEach(([hash, entry]) => {
-                const entryDate = new Date(entry.timestamp);
-                
-                // Check for cached items older than 7 days
-                if (entryDate < sevenDaysAgo && entry.cached === true) {
-                    console.log(`Expiring cache for entry: ${hash} (${entry.timestamp})`);
-                    this.cacheTable.get(hash).put({
-                        cached: 'unchecked',
-                        timestamp: entry.timestamp
-                    }, (ack) => {
-                        if (ack.err) {
-                            console.error(`Error updating cache status for ${hash}:`, ack.err);
-                        } else {
-                            console.log(`Successfully expired cache for ${hash}`);
-                        }
-                    });
-                }
-                
-                // Check for uncached items older than 24 hours
-                if (entryDate < oneDayAgo && entry.cached === false) {
-                    console.log(`Moving uncached entry to unchecked state: ${hash} (${entry.timestamp})`);
-                    this.cacheTable.get(hash).put({
-                        cached: 'unchecked',
-                        timestamp: entry.timestamp
-                    }, (ack) => {
-                        if (ack.err) {
-                            console.error(`Error updating cache status for ${hash}:`, ack.err);
-                        } else {
-                            console.log(`Successfully moved entry to unchecked state: ${hash}`);
-                        }
-                    });
-                }
-            });
-        });
-    }
-
 }
 
 // Parse command line arguments
@@ -580,11 +719,6 @@ const initializeRelays = async () => {
         
         // Initialize node after relay discovery
         await node.initialize();
-        
-        // Set up hourly cache expiration check
-        setInterval(() => {
-            node.checkCacheExpiration();
-        }, 60 * 60 * 1000); // Run every hour
         
     } catch (err) {
         console.error('Error initializing relays:', err);
