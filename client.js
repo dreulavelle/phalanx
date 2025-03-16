@@ -67,6 +67,7 @@ class GunNode {
         this.app = express();
         this.setupExpress();
         this.connectedPeers = new Set();
+        this.connectedWebRTCPeers = new Set();  // Add new set for WebRTC peers
         this.lastSyncTime = null;
         this.startupTime = new Date(); // Track when this node started
         this.seenEntries = new Set(); // Track entries we've already seen
@@ -286,8 +287,11 @@ class GunNode {
                     port: this.config.port
                 },
                 peers: {
-                    connected: Object.keys(peers).length,
-                    addresses: Object.keys(peers)
+                    relay_servers: Array.from(this.connectedPeers),
+                    webrtc_peers: {
+                        connected: this.connectedWebRTCPeers.size,
+                        peers: Array.from(this.connectedWebRTCPeers)
+                    }
                 },
                 storage: {
                     enabled: this.gun._.opt.file ? true : false,
@@ -386,7 +390,7 @@ class GunNode {
                     iceServers: [
                         { urls: 'stun:stun.l.google.com:19302' },
                         { urls: 'stun:stun1.l.google.com:19302' },
-                        { urls: 'stun:stun2.l.google.com:19302' },
+                        { urls: 'stun2.l.google.com:19302' },
                         {
                             urls: 'turn:openrelay.metered.ca:443',
                             username: 'openrelayproject',
@@ -396,16 +400,28 @@ class GunNode {
                 }
             });
 
-
-            // Log all SEA-related operations
-            this.gun.on('auth', ack => {
-                if (ack.err) {
-                    console.error('Authentication Error:', {
-                        timestamp: new Date().toISOString(),
-                        error: ack.err
-                    });
+            // Track peer connections
+            this.gun.on('hi', peer => {
+                const peerUrl = peer.url || peer.id;
+                
+                // Check if this is a WebRTC peer
+                if (peer.url && peer.url.startsWith('http')) {
+                    // This is a relay server
+                    this.connectedPeers.add(peerUrl);
+                } else {
+                    // This is likely a WebRTC peer
+                    this.connectedWebRTCPeers.add(peerUrl);
                 }
             });
+
+            this.gun.on('bye', peer => {
+                const peerUrl = peer.url || peer.id;
+                
+                // Remove from both sets (only one removal will actually happen)
+                this.connectedPeers.delete(peerUrl);
+                this.connectedWebRTCPeers.delete(peerUrl);
+            });
+
 
             // Initialize the cache table
             this.cacheTable = this.gun.get('cache');
