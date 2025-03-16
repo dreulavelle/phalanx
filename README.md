@@ -7,6 +7,7 @@ A Node.js implementation with Express server integration built on Gun.JS. Phalan
 - Gun.js peer-to-peer database integration
 - Express server setup
 - Rate limiting for endpoints
+- Multi-service support: track the same infohash across different services
 - Cache management:
   - Two-state cache system: `cached` and `uncached`
   - Automatic expiry calculation when not explicitly provided:
@@ -108,9 +109,18 @@ curl http://localhost:3000/data \
 ### Get Specific Data by Infohash
 
 ```bash
+# Get data for a specific infohash (across all services)
 curl http://localhost:3000/data/example_hash_123 \
   -H "Authorization: Bearer TOKEN"
+
+# Get data for a specific infohash and service
+curl http://localhost:3000/data/example_hash_123?service=real_debrid \
+  -H "Authorization: Bearer TOKEN"
 ```
+
+Responses:
+- When querying by infohash alone, you'll receive all entries for that infohash across different services
+- When specifying a service parameter, you'll receive only the matching entry
 
 ### Debug Endpoint
 

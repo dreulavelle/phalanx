@@ -306,21 +306,56 @@ class GunNode {
         });
 
         // Get specific data endpoint (protected)
-        this.app.get('/data/:key', authenticateRequest, (req, res) => {
+        this.app.get('/data/:infohash', authenticateRequest, async (req, res) => {
             if (!this.gun) {
                 return res.status(503).json({ error: 'Database not initialized' });
             }
 
-            this.getData(req.params.key, (data) => {
-                if (!data) {
-                    return res.status(404).json({ error: 'Data not found' });
-                }
-                
-                // Clean and return the data
-                const cleanedData = this.cleanData(data);
-                cleanedData.infohash = req.params.key; // Ensure infohash is included
-                res.json(cleanedData);
-            });
+            const infohash = req.params.infohash;
+            const service = req.query.service;
+
+            if (service) {
+                // If service is specified, get the specific entry
+                this.getDataByInfohashAndService(infohash, service, (data) => {
+                    if (!data) {
+                        return res.status(404).json({ error: 'Data not found' });
+                    }
+                    res.json(data);
+                });
+            } else {
+                // If no service is specified, find all entries for this infohash
+                this.getAllData((allData) => {
+                    const matchingEntries = [];
+                    
+                    // Search for entries with the matching infohash
+                    Object.entries(allData).forEach(([key, value]) => {
+                        if (key.startsWith(`${infohash}_`)) {
+                            // This is a match, extract service from key
+                            const [_, service] = key.split('_');
+                            const cleanedData = this.cleanData(value);
+                            cleanedData.infohash = infohash;
+                            cleanedData.service = service;
+                            matchingEntries.push(cleanedData);
+                        }
+                    });
+                    
+                    if (matchingEntries.length === 0) {
+                        return res.status(404).json({ error: 'Data not found' });
+                    }
+                    
+                    // Sort by most recent
+                    matchingEntries.sort((a, b) => {
+                        const dateA = a.last_modified ? new Date(a.last_modified).getTime() : 0;
+                        const dateB = b.last_modified ? new Date(b.last_modified).getTime() : 0;
+                        return dateB - dateA;
+                    });
+                    
+                    res.json({
+                        total: matchingEntries.length,
+                        data: matchingEntries
+                    });
+                });
+            }
         });
     }
 
@@ -519,8 +554,8 @@ class GunNode {
     }
 
     // Get data with SEA decryption
-    async getData(infohash, callback) {
-        this.cacheTable.get(infohash).once(async (data) => {
+    async getData(key, callback, isCompositeKey = false) {
+        this.cacheTable.get(key).once(async (data) => {
             if (!data) {
                 callback(null);
                 return;
@@ -530,12 +565,19 @@ class GunNode {
                 // Make a copy of the raw data
                 const retrievedData = JSON.parse(JSON.stringify(data));
                 
-                // Add infohash to the data
-                retrievedData.infohash = infohash;
+                if (!isCompositeKey && key.includes('_')) {
+                    // If this is a composite key, extract the infohash and service
+                    const [infohash, service] = key.split('_');
+                    retrievedData.infohash = infohash;
+                    retrievedData.service = service;
+                } else {
+                    // Otherwise just add the infohash
+                    retrievedData.infohash = key;
+                }
                 
                 // Check if data exists
                 if (!retrievedData.last_modified) {
-                    console.warn(`Invalid data format for infohash: ${infohash}`);
+                    console.warn(`Invalid data format for key: ${key}`);
                     callback(null);
                     return;
                 }
@@ -544,10 +586,16 @@ class GunNode {
                 const cleanedData = this.cleanData(retrievedData);
                 callback(cleanedData);
             } catch (error) {
-                console.error(`Error processing data for infohash ${infohash}:`, error);
+                console.error(`Error processing data for key ${key}:`, error);
                 callback(null);
             }
         });
+    }
+
+    // New method to get data by infohash and service
+    async getDataByInfohashAndService(infohash, service, callback) {
+        const compositeKey = `${infohash}_${service}`;
+        this.getData(compositeKey, callback, true);
     }
 
     // Get all data with SEA decryption
@@ -595,6 +643,9 @@ class GunNode {
             last_modified: data.last_modified || new Date().toISOString()
         };
         
+        // Create a composite key
+        const compositeKey = `${infohash}_${processedData.service}`;
+        
         // Directly preserve cached without logic
         if (data.cached === true) {
             processedData.cached = true;
@@ -625,7 +676,7 @@ class GunNode {
         }
 
         return new Promise((resolve) => {
-            this.cacheTable.get(infohash).put(processedData, (ack) => {
+            this.cacheTable.get(compositeKey).put(processedData, (ack) => {
                 if (ack.err) {
                     console.error('Error storing data:', ack.err);
                     resolve(false);
@@ -643,10 +694,24 @@ class GunNode {
         return new Promise((resolve) => {
             this.getAllData((allData) => {
                 let entries = Object.entries(allData)
-                    .map(([hash, data]) => ({
-                        infohash: hash,
-                        ...this.cleanData(data)
-                    }));
+                    .map(([key, data]) => {
+                        // Parse the composite key to get infohash and service
+                        let infohash, service;
+                        if (key.includes('_')) {
+                            [infohash, service] = key.split('_');
+                        } else {
+                            infohash = key;
+                            service = data.service;
+                        }
+                        
+                        // Create entry with parsed data
+                        const cleanedData = this.cleanData(data);
+                        return {
+                            infohash,
+                            service,
+                            ...cleanedData
+                        };
+                    });
                 
                 // Apply timestamp filters if provided
                 if (minTimestamp) {
