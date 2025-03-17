@@ -78,6 +78,10 @@ class GunNode {
             peers: [] // Will be populated dynamically
         };
         this.pair = null; // Will store SEA key pair
+        
+        // Add a simple in-memory cache for frequently accessed entries
+        this.entryCache = new Map();
+        this.entryCacheTTL = 60000; // 60 seconds cache TTL
     }
 
     setupExpress() {
@@ -311,41 +315,216 @@ class GunNode {
 
         // Get specific data endpoint (protected)
         this.app.get('/data/:infohash', authenticateRequest, async (req, res) => {
+            const startTime = Date.now();
+            
             if (!this.gun) {
                 return res.status(503).json({ error: 'Database not initialized' });
             }
 
-            const infohash = req.params.infohash;
-            const service = req.query.service;
+            let infohashes;
+            if (req.params.infohash.includes(',')) {
+                // Handle multiple infohashes
+                infohashes = req.params.infohash.split(',').map(hash => hash.trim());
+            } else {
+                // Single infohash
+                infohashes = [req.params.infohash];
+            }
 
-            if (service) {
-                // If service is specified, get the specific entry
-                this.getDataByInfohashAndService(infohash, service, (data) => {
-                    if (!data) {
+            const service = req.query.service;
+            
+            // OPTIMIZATION 1: For single infohash + service requests, use direct key lookup
+            if (infohashes.length === 1 && service) {
+                const directLookupStart = Date.now();
+                
+                // Use the composite key format
+                const compositeKey = `${infohashes[0]}_${service}`;
+                
+                // Wrap in a promise for easier handling
+                try {
+                    const directResult = await new Promise((resolve) => {
+                        this.getData(compositeKey, (data) => {
+                            // Fix the infohash field to not include the service
+                            if (data) {
+                                // Ensure the infohash doesn't include the service
+                                data.infohash = infohashes[0];
+                            }
+                            resolve(data);
+                        }, true);
+                    });
+                    
+                    const lookupTime = Date.now() - directLookupStart;
+                    
+                    if (!directResult) {
                         return res.status(404).json({ error: 'Data not found' });
                     }
-                    res.json(data);
-                });
-            } else {
-                // If no service is specified, find all entries for this infohash
-                this.getAllData((allData) => {
+                    
+                    return res.json({
+                        total: 1,
+                        data: [directResult]
+                    });
+                } catch (error) {
+                    console.error('Error during direct lookup:', error);
+                    // Fall back to the original method if direct lookup fails
+                }
+            }
+            
+            // OPTIMIZATION 2: For single infohash without service specified, use a more selective approach
+            if (infohashes.length === 1 && !service) {
+                // Instead of filtering through all data, we'll try a different approach
+                const patternLookupStart = Date.now();
+                
+                try {
+                    // This is a key insight: Gun doesn't support pattern matching natively
+                    // But we can use a different graph traversal approach
+                    
+                    // First, try to get potential services from the in-memory cache
+                    const cacheKeys = Array.from(this.entryCache.keys());
+                    const potentialCachedServices = cacheKeys
+                        .filter(key => key.startsWith(`${infohashes[0]}_`))
+                        .map(key => key.split('_')[1]);
+                    
+                    // Known common services to check directly first (optimization)
+                    const commonServices = [...potentialCachedServices, 'real_debrid', 'premiumize', 'all_debrid', 'debrid_link'];
+                    const targetInfohash = infohashes[0];
                     const matchingEntries = [];
                     
-                    // Search for entries with the matching infohash
-                    Object.entries(allData).forEach(([key, value]) => {
-                        if (key.startsWith(`${infohash}_`)) {
-                            // This is a match, extract service from key
-                            const [_, service] = key.split('_');
-                            const cleanedData = this.cleanData(value);
-                            cleanedData.infohash = infohash;
-                            cleanedData.service = service;
-                            matchingEntries.push(cleanedData);
+                    // Check the common services directly first - this is much faster than scanning all keys
+                    await Promise.all(commonServices.map(async (svc) => {
+                        const compositeKey = `${targetInfohash}_${svc}`;
+                        
+                        try {
+                            // Use a promise wrapper around the Gun get for cleaner async handling
+                            const result = await new Promise((resolve) => {
+                                // Set a timeout to avoid hanging if the key doesn't exist
+                                const timeoutId = setTimeout(() => {
+                                    resolve(null);
+                                }, 300); // Short timeout for direct lookups
+                                
+                                this.cacheTable.get(compositeKey).once((data) => {
+                                    clearTimeout(timeoutId);
+                                    if (data && Object.keys(data).length > 0) {
+                                        // Process and clean the data
+                                        const cleanedData = this.cleanData(data);
+                                        // Fix the infohash to be just the infohash, not the composite key
+                                        cleanedData.infohash = targetInfohash;
+                                        cleanedData.service = svc;
+                                        resolve(cleanedData);
+                                    } else {
+                                        resolve(null);
+                                    }
+                                });
+                            });
+                            
+                            if (result) {
+                                matchingEntries.push(result);
+                            }
+                        } catch (error) {
+                            console.error(`Error during direct key check for ${compositeKey}:`, error);
                         }
+                    }));
+                    
+                    // Only do a partial scan if we didn't find anything with direct lookups
+                    if (matchingEntries.length === 0) {
+                        // We'll limit this scan to a reasonable time to avoid hanging
+                        const scanTimeoutMs = 500;
+                        const scanStartTime = Date.now();
+                        
+                        await new Promise((resolve) => {
+                            // Set a timeout for the overall operation
+                            const scanTimeoutId = setTimeout(() => {
+                                resolve();
+                            }, scanTimeoutMs);
+                            
+                            // Use a much shorter collect cycle to find services faster
+                            let scanDone = false;
+                            const targetPrefix = `${targetInfohash}_`;
+                            
+                            this.cacheTable.map().on((data, key) => {
+                                // Skip processing if we're already done
+                                if (scanDone) return;
+                                
+                                if (key && key.startsWith(targetPrefix)) {
+                                    try {
+                                        const [infohash, entryService] = key.split('_');
+                                        if (data && Object.keys(data).length > 0) {
+                                            const cleanedData = this.cleanData(data);
+                                            // Fix the infohash to be just the infohash, not the composite key
+                                            cleanedData.infohash = infohash;
+                                            cleanedData.service = entryService;
+                                            matchingEntries.push(cleanedData);
+                                            
+                                            // We found at least one match, can complete soon
+                                            setTimeout(() => {
+                                                if (!scanDone) {
+                                                    scanDone = true;
+                                                    clearTimeout(scanTimeoutId);
+                                                    resolve();
+                                                }
+                                            }, 100); // Short delay to allow for any other immediate matches
+                                        }
+                                    } catch (error) {
+                                        console.error(`Error processing entry during scan:`, error);
+                                    }
+                                }
+                                
+                                // Check if we've hit the time limit
+                                if (Date.now() - scanStartTime > scanTimeoutMs && !scanDone) {
+                                    scanDone = true;
+                                    clearTimeout(scanTimeoutId);
+                                    resolve();
+                                }
+                            });
+                        });
+                    }
+                    
+                    // Sort entries by timestamp
+                    matchingEntries.sort((a, b) => {
+                        const dateA = a.last_modified ? new Date(a.last_modified).getTime() : 0;
+                        const dateB = b.last_modified ? new Date(b.last_modified).getTime() : 0;
+                        return dateB - dateA;
                     });
                     
                     if (matchingEntries.length === 0) {
                         return res.status(404).json({ error: 'Data not found' });
                     }
+                    
+                    return res.json({
+                        total: matchingEntries.length,
+                        data: matchingEntries
+                    });
+                } catch (error) {
+                    console.error('Error during optimized access:', error);
+                    // Fall back to the original method if optimized approach fails
+                }
+            }
+            
+            // For multiple infohashes or if the optimizations failed, use the original approach
+            const getAllDataStart = Date.now();
+            
+            // Get all data and then filter
+            this.getAllData((allData) => {
+                const getAllDataTime = Date.now() - getAllDataStart;
+                
+                const processingStart = Date.now();
+                const results = {};
+                
+                infohashes.forEach(infohash => {
+                    const matchingEntries = [];
+                    
+                    // Search for entries with the matching infohash
+                    Object.entries(allData).forEach(([key, value]) => {
+                        if (key.startsWith(`${infohash}_`)) {
+                            // If service is specified, only include matching service
+                            const [_, entryService] = key.split('_');
+                            if (!service || service === entryService) {
+                                const cleanedData = this.cleanData(value);
+                                // Ensure we use the pure infohash (without service)
+                                cleanedData.infohash = infohash;
+                                cleanedData.service = entryService;
+                                matchingEntries.push(cleanedData);
+                            }
+                        }
+                    });
                     
                     // Sort by most recent
                     matchingEntries.sort((a, b) => {
@@ -354,12 +533,26 @@ class GunNode {
                         return dateB - dateA;
                     });
                     
-                    res.json({
+                    results[infohash] = {
                         total: matchingEntries.length,
                         data: matchingEntries
-                    });
+                    };
                 });
-            }
+                
+                // If only one infohash was requested, maintain backward compatibility
+                if (infohashes.length === 1) {
+                    const singleResult = results[infohashes[0]];
+                    if (singleResult.total === 0) {
+                        return res.status(404).json({ error: 'Data not found' });
+                    }
+                    return res.json(singleResult);
+                }
+                
+                res.json({
+                    total_hashes: infohashes.length,
+                    results: results
+                });
+            });
         });
     }
 
@@ -457,6 +650,11 @@ class GunNode {
             last_modified: data.last_modified,
             expiry: data.expiry || null
         };
+
+        // If infohash contains a service suffix, extract just the infohash part
+        if (cleaned.infohash && cleaned.infohash.includes('_')) {
+            cleaned.infohash = cleaned.infohash.split('_')[0];
+        }
 
         // Explicitly preserve cached property if it exists
         if (data.cached === true || data.cached === false) {
@@ -571,6 +769,22 @@ class GunNode {
 
     // Get data with SEA decryption
     async getData(key, callback, isCompositeKey = false) {
+        const startTime = Date.now();
+        
+        // Check the cache first
+        if (this.entryCache.has(key)) {
+            const cachedEntry = this.entryCache.get(key);
+            // Check if the cached entry is still valid
+            if (Date.now() < cachedEntry.expiry) {
+                callback(cachedEntry.data);
+                return;
+            } else {
+                // Remove expired entry
+                this.entryCache.delete(key);
+            }
+        }
+        
+        // Proceed with normal retrieval if not in cache
         this.cacheTable.get(key).once(async (data) => {
             if (!data) {
                 callback(null);
@@ -600,6 +814,13 @@ class GunNode {
                 
                 // Clean the data before returning
                 const cleanedData = this.cleanData(retrievedData);
+                
+                // Store in cache
+                this.entryCache.set(key, {
+                    data: cleanedData,
+                    expiry: Date.now() + this.entryCacheTTL
+                });
+                
                 callback(cleanedData);
             } catch (error) {
                 console.error(`Error processing data for key ${key}:`, error);
@@ -639,7 +860,7 @@ class GunNode {
             if (checkComplete()) {
                 clearInterval(intervalId);
             }
-        }, 100);
+        }, 500); // Reduced interval frequency to avoid log spam
         
         this.cacheTable.map().once((data, hash) => {
             if (data) {
@@ -689,6 +910,13 @@ class GunNode {
             const expiryDate = new Date(processedData.last_modified);
             expiryDate.setHours(expiryDate.getHours() + 24); // 24 hours for cached=false
             processedData.expiry = expiryDate.toISOString();
+        }
+
+        // Update or invalidate the cache for this key
+        if (this.entryCache.has(compositeKey)) {
+            // Remove from cache - we'll update it on next retrieval
+            this.entryCache.delete(compositeKey);
+            console.log(`Cache entry invalidated for key: ${compositeKey} (data updated)`);
         }
 
         return new Promise((resolve) => {

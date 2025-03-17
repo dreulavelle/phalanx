@@ -67,7 +67,7 @@ All endpoints require authentication using a Bearer token. The encryption key sh
 ### Add Data
 
 ```bash
-curl -X POST http://localhost:3000/data \
+curl -X POST http://localhost:8888/data \
   -H "Authorization: Bearer TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -102,7 +102,7 @@ The `cached` field and expiry handling:
 ### Get All Data
 
 ```bash
-curl http://localhost:3000/data \
+curl http://localhost:8888/data \
   -H "Authorization: Bearer TOKEN"
 ```
 
@@ -110,11 +110,11 @@ curl http://localhost:3000/data \
 
 ```bash
 # Get data for a specific infohash (across all services)
-curl http://localhost:3000/data/example_hash_123 \
+curl http://localhost:8888/data/example_hash_123 \
   -H "Authorization: Bearer TOKEN"
 
 # Get data for a specific infohash and service
-curl http://localhost:3000/data/example_hash_123?service=real_debrid \
+curl http://localhost:8888/data/example_hash_123?service=real_debrid \
   -H "Authorization: Bearer TOKEN"
 ```
 
@@ -125,7 +125,7 @@ Responses:
 ### Debug Endpoint
 
 ```bash
-curl http://localhost:3000/debug \
+curl http://localhost:8888/debug \
   -H "Authorization: Bearer TOKEN"
 ```
 
