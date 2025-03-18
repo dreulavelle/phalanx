@@ -23,3 +23,10 @@ Thumbs.db
 # Gun.js specific
 gun-relays/
 node-data.json/ 
+nohup.out
+backup_db.js
+null_old_data.js
+NULL_OPERATION_README.md
+run_null_operation.sh
+
+backups
