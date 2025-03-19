@@ -1126,11 +1126,13 @@ class GunNode {
         // Add or update the service data in the nested structure
         processedData.services[serviceName] = serviceData;
 
-        // Update or invalidate the cache for this infohash
+        // Update the cache with the new data
         if (this.entryCache.has(infohash)) {
-            // Remove from cache - we'll update it on next retrieval
-            this.entryCache.delete(infohash);
-            console.log(`Cache entry invalidated for infohash: ${infohash} (data updated)`);
+            this.entryCache.set(infohash, {
+                data: processedData,
+                expiry: Date.now() + this.entryCacheTTL
+            });
+            console.log(`Cache entry updated for infohash: ${infohash}`);
         }
 
         // Encrypt the processed data
