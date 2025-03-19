@@ -187,6 +187,9 @@ class GunNode {
                     error: 'Invalid data types. infohash and service must be strings.'
                 });
             }
+
+            // Normalize service name: convert to lowercase and replace spaces with underscores
+            data.service = data.service.toLowerCase().replace(/\s+/g, '_');
             
             if (typeof data.cached !== 'boolean') {
                 return res.status(400).json({ 
@@ -229,7 +232,6 @@ class GunNode {
             if (!this.gun) {
                 return res.status(503).json({ error: 'Database not initialized' });
             }
-            console.log('Received /data request with query:', req.query);
             
             try {
                 const result = await this.getFilteredData({
@@ -239,37 +241,10 @@ class GunNode {
                     maxTimestamp: req.query.maxTimestamp
                 });
 
-                // Clean the data before sending
-                result.data = result.data.map(entry => this.cleanData(entry));
-                
-                // Apply schema validation to ensure all required fields are present
-                // Filter out any entries that don't pass validation
-                let validEntries = result.data.filter(entry => this.validateSchema(entry));
-                
-                // Log if entries were filtered due to schema validation
-                if (validEntries.length < result.data.length) {
-                    console.warn(`Filtered out ${result.data.length - validEntries.length} entries due to schema validation failures`);
-                }
-                
-                // Update to use only valid entries
-                result.data = validEntries;
-
-                // Sort the cleaned data by timestamp (newest first)
-                result.data.sort((a, b) => {
-                    const dateA = a.last_modified ? new Date(a.last_modified).getTime() : 0;
-                    const dateB = b.last_modified ? new Date(b.last_modified).getTime() : 0;
-                    return dateB - dateA;
-                });
-                
-                // Apply the limit after sorting
-                const limit = parseInt(req.query.limit) || 50;
-                result.data = result.data.slice(0, limit);
-                result.limit = limit;
-                result.total = result.data.length;
-                
-                // Add schema version to the response
-                result.schema_version = "1.0";
-                result.schema_fields = ["infohash", "cached", "service", "last_modified", "expiry"];
+                // Update schema version to 2.0
+                result.schema_version = "2.0";
+                // Remove schema_fields as they're now defined by the structure
+                delete result.schema_fields;
                 
                 res.json(result);
             } catch (error) {
@@ -284,17 +259,49 @@ class GunNode {
                 return res.status(503).json({ error: 'Database not initialized' });
             }
 
-            const peers = this.gun._.opt.peers || {};
+            // Get all peers using gun.back('opt.peers')
+            const allPeers = this.gun.back('opt.peers') || {};
+            const relayServers = [];
+            const webrtcPeers = [];
+
+            // Process peers and categorize them
+            Object.entries(allPeers).forEach(([url, peer]) => {
+                if (url.startsWith('http')) {
+                    relayServers.push(url);
+                } else {
+                    webrtcPeers.push(url);
+                }
+            });
+
             let dataCount = 0;
             let validCount = 0;
 
-            // Get data count
+            // Get data count using the same validation logic as /data endpoint
             await new Promise((resolve) => {
                 this.getAllData((allData) => {
                     dataCount = Object.keys(allData).length;
-                    validCount = Object.values(allData).filter(data => 
-                        data && data.last_modified && data.cached !== undefined
-                    ).length;
+                    
+                    // Count valid entries using the same logic as /data endpoint
+                    Object.values(allData).forEach(data => {
+                        if (data && data.services && typeof data.services === 'object') {
+                            // Check if at least one service has valid data
+                            const hasValidService = Object.values(data.services).some(service => {
+                                return (
+                                    service &&
+                                    typeof service === 'object' &&
+                                    (service.cached === true || service.cached === false) &&
+                                    service.last_modified &&
+                                    isValidISODate(service.last_modified) &&
+                                    service.expiry &&
+                                    isValidISODate(service.expiry)
+                                );
+                            });
+                            
+                            if (hasValidService) {
+                                validCount++;
+                            }
+                        }
+                    });
                     resolve();
                 });
             });
@@ -303,14 +310,13 @@ class GunNode {
                 node: {
                     id: NODE_ID,
                     uptime: Math.floor((Date.now() - this.startupTime) / 1000),
-                    mode: this.config.isRemoteServer ? 'remote' : 'local',
                     port: this.config.port
                 },
                 peers: {
-                    relay_servers: Array.from(this.connectedPeers),
+                    relay_servers: relayServers,
                     webrtc_peers: {
-                        connected: this.connectedWebRTCPeers.size,
-                        peers: Array.from(this.connectedWebRTCPeers)
+                        connected: webrtcPeers.length,
+                        peers: webrtcPeers
                     }
                 },
                 storage: {
@@ -324,8 +330,7 @@ class GunNode {
                 encryption: {
                     enabled: !!ENCRYPTION_KEY,
                     sea: !!this.pair
-                },
-                lastSync: this.lastSyncTime ? new Date(this.lastSyncTime).toISOString() : null
+                }
             });
         });
 
@@ -348,250 +353,155 @@ class GunNode {
 
             const service = req.query.service;
             
-            // OPTIMIZATION 1: For single infohash + service requests, use direct key lookup
-            if (infohashes.length === 1 && service) {
-                const directLookupStart = Date.now();
-                
-                // Use the composite key format
-                const compositeKey = `${infohashes[0]}|${service}`;
-                
-                // Wrap in a promise for easier handling
-                try {
-                    const directResult = await new Promise((resolve) => {
-                        this.getData(compositeKey, (data) => {
-                            // Fix the infohash field to not include the service
-                            if (data) {
-                                // Ensure the infohash doesn't include the service
-                                data.infohash = infohashes[0];
-                            }
-                            resolve(data);
-                        }, true);
-                    });
-                    
-                    const lookupTime = Date.now() - directLookupStart;
-                    
-                    if (!directResult) {
-                        return res.status(404).json({ error: 'Data not found' });
-                    }
-                    
-                    // Validate the schema now that we have a result
-                    if (!this.validateSchema(directResult)) {
-                        console.warn(`Direct lookup result for ${compositeKey} failed schema validation, will not be returned`);
-                        return res.status(404).json({ error: 'Data not found (schema validation failed)' });
-                    }
-                    
-                    return res.json({
-                        total: 1,
-                        data: [directResult],
-                        schema_version: "1.0",
-                        schema_fields: ["infohash", "cached", "service", "last_modified", "expiry"]
-                    });
-                } catch (error) {
-                    console.error('Error during direct lookup:', error);
-                    // Fall back to the original method if direct lookup fails
+            // Prevent multiple responses
+            let hasResponded = false;
+            const sendResponse = (statusCode, data) => {
+                if (!hasResponded) {
+                    hasResponded = true;
+                    res.status(statusCode).json(data);
                 }
-            }
+            };
             
-            // OPTIMIZATION 2: For single infohash without service specified, use a more selective approach
-            if (infohashes.length === 1 && !service) {
-                // Instead of filtering through all data, we'll try a different approach
-                const patternLookupStart = Date.now();
-                
-                try {
-                    // This is a key insight: Gun doesn't support pattern matching natively
-                    // But we can use a different graph traversal approach
-                    
-                    // First, try to get potential services from the in-memory cache
-                    const cacheKeys = Array.from(this.entryCache.keys());
-                    const potentialCachedServices = cacheKeys
-                        .filter(key => key.startsWith(`${infohashes[0]}|`))
-                        .map(key => key.split('|')[1]);
-                    
-                    // Known common services to check directly first (optimization)
-                    const commonServices = [...potentialCachedServices, 'real_debrid', 'premiumize', 'all_debrid', 'debrid_link'];
-                    const targetInfohash = infohashes[0];
-                    const matchingEntries = [];
-                    
-                    // Check the common services directly first - this is much faster than scanning all keys
-                    await Promise.all(commonServices.map(async (svc) => {
-                        const compositeKey = `${targetInfohash}|${svc}`;
-                        
-                        try {
-                            // Use a promise wrapper around the Gun get for cleaner async handling
-                            const result = await new Promise((resolve) => {
-                                // Set a timeout to avoid hanging if the key doesn't exist
-                                const timeoutId = setTimeout(() => {
-                                    resolve(null);
-                                }, 300); // Short timeout for direct lookups
-                                
-                                this.cacheTable.get(compositeKey).once((data) => {
-                                    clearTimeout(timeoutId);
-                                    if (data && Object.keys(data).length > 0) {
-                                        // Process and clean the data
-                                        const cleanedData = this.cleanData(data);
-                                        // Fix the infohash to be just the infohash, not the composite key
-                                        cleanedData.infohash = targetInfohash;
-                                        cleanedData.service = svc;
-                                        resolve(cleanedData);
-                                    } else {
-                                        resolve(null);
-                                    }
-                                });
-                            });
-                            
-                            if (result) {
-                                matchingEntries.push(result);
-                            }
-                        } catch (error) {
-                            console.error(`Error during direct key check for ${compositeKey}:`, error);
-                        }
-                    }));
-                    
-                    // Only do a partial scan if we didn't find anything with direct lookups
-                    if (matchingEntries.length === 0) {
-                        // We'll limit this scan to a reasonable time to avoid hanging
-                        const scanTimeoutMs = 500;
-                        const scanStartTime = Date.now();
-                        
-                        await new Promise((resolve) => {
-                            // Set a timeout for the overall operation
-                            const scanTimeoutId = setTimeout(() => {
-                                resolve();
-                            }, scanTimeoutMs);
-                            
-                            // Use a much shorter collect cycle to find services faster
-                            let scanDone = false;
-                            const targetPrefix = `${targetInfohash}|`;
-                            
-                            this.cacheTable.map().on((data, key) => {
-                                // Skip processing if we're already done
-                                if (scanDone) return;
-                                
-                                if (key && key.startsWith(targetPrefix)) {
-                                    try {
-                                        const [infohash, entryService] = key.split('|');
-                                        if (data && Object.keys(data).length > 0) {
-                                            const cleanedData = this.cleanData(data);
-                                            // Fix the infohash to be just the infohash, not the composite key
-                                            cleanedData.infohash = infohash;
-                                            cleanedData.service = entryService;
-                                            matchingEntries.push(cleanedData);
-                                            
-                                            // We found at least one match, can complete soon
-                                            setTimeout(() => {
-                                                if (!scanDone) {
-                                                    scanDone = true;
-                                                    clearTimeout(scanTimeoutId);
-                                                    resolve();
-                                                }
-                                            }, 100); // Short delay to allow for any other immediate matches
-                                        }
-                                    } catch (error) {
-                                        console.error(`Error processing entry during scan:`, error);
-                                    }
-                                }
-                                
-                                // Check if we've hit the time limit
-                                if (Date.now() - scanStartTime > scanTimeoutMs && !scanDone) {
-                                    scanDone = true;
-                                    clearTimeout(scanTimeoutId);
-                                    resolve();
-                                }
-                            });
-                        });
-                    }
-                    
-                    // Filter entries based on schema validation
-                    const validEntries = matchingEntries.filter(entry => this.validateSchema(entry));
-                    
-                    // Log if entries were filtered due to schema validation
-                    if (validEntries.length < matchingEntries.length) {
-                        console.warn(`Filtered out ${matchingEntries.length - validEntries.length} entries during pattern matching for ${targetInfohash} due to schema validation failures`);
-                    }
-                    
-                    if (validEntries.length === 0) {
-                        return res.status(404).json({ error: 'Data not found' });
-                    }
-                    
-                    return res.json({
-                        total: validEntries.length,
-                        data: validEntries,
-                        schema_version: "1.0",
-                        schema_fields: ["infohash", "cached", "service", "last_modified", "expiry"]
-                    });
-                } catch (error) {
-                    console.error('Error during optimized access:', error);
-                    // Fall back to the original method if optimized approach fails
-                }
-            }
-            
-            // For multiple infohashes or if the optimizations failed, use the original approach
-            const getAllDataStart = Date.now();
-            
-            // Get all data and then filter
-            this.getAllData((allData) => {
-                const getAllDataTime = Date.now() - getAllDataStart;
-                
-                const processingStart = Date.now();
-                const results = {};
-                
-                infohashes.forEach(infohash => {
-                    const matchingEntries = [];
-                    
-                    // Search for entries with the matching infohash
-                    Object.entries(allData).forEach(([key, value]) => {
-                        if (key.startsWith(`${infohash}|`)) {
-                            // If service is specified, only include matching service
-                            const [_, entryService] = key.split('|');
-                            if (!service || service === entryService) {
-                                const cleanedData = this.cleanData(value);
-                                // Ensure we use the pure infohash (without service)
-                                cleanedData.infohash = infohash;
-                                cleanedData.service = entryService;
-                                matchingEntries.push(cleanedData);
-                            }
-                        }
-                    });
-                    
-                    // Filter entries based on schema validation
-                    const validEntries = matchingEntries.filter(entry => this.validateSchema(entry));
-                    
-                    // Log if entries were filtered due to schema validation
-                    if (validEntries.length < matchingEntries.length) {
-                        console.warn(`Filtered out ${matchingEntries.length - validEntries.length} entries for infohash ${infohash} due to schema validation failures`);
-                    }
-                    
-                    // Sort by most recent
-                    validEntries.sort((a, b) => {
-                        const dateA = a.last_modified ? new Date(a.last_modified).getTime() : 0;
-                        const dateB = b.last_modified ? new Date(b.last_modified).getTime() : 0;
-                        return dateB - dateA;
-                    });
-                    
-                    results[infohash] = {
-                        total: validEntries.length,
-                        data: validEntries,
-                        schema_version: "1.0",
-                        schema_fields: ["infohash", "cached", "service", "last_modified", "expiry"]
-                    };
-                });
-                
-                // If only one infohash was requested, maintain backward compatibility
+            try {
+                // For single infohash, use direct lookup
                 if (infohashes.length === 1) {
-                    const singleResult = results[infohashes[0]];
-                    if (singleResult.total === 0) {
-                        return res.status(404).json({ error: 'Data not found' });
-                    }
-                    return res.json(singleResult);
+                    this.getData(infohashes[0], (data) => {
+                        if (!data) {
+                            return sendResponse(404, { error: 'Data not found' });
+                        }
+
+                        // If service specified, only include that service
+                        if (service && data.services) {
+                            const serviceData = data.services[service];
+                            if (!serviceData) {
+                                return sendResponse(404, { error: 'Service not found for this infohash' });
+                            }
+
+                            const result = {
+                                total: 1,
+                                data: [{
+                                    infohash: data.infohash,
+                                    services: {
+                                        [service]: serviceData
+                                    }
+                                }],
+                                schema_version: "2.0"
+                            };
+                            return sendResponse(200, result);
+                        }
+
+                        // Return full data if no service specified
+                        return sendResponse(200, {
+                            total: 1,
+                            data: [data],
+                            schema_version: "2.0"
+                        });
+                    });
+                    return;
                 }
                 
-                res.json({
-                    total_hashes: infohashes.length,
-                    results: results,
-                    schema_version: "1.0",
-                    schema_fields: ["infohash", "cached", "service", "last_modified", "expiry"]
+                // For multiple infohashes or no service specified, use existing getAllData approach
+                this.getAllData((allData) => {
+                    if (hasResponded) return; // Skip if we've already responded
+                    
+                    const results = {};
+                    
+                    infohashes.forEach(infohash => {
+                        // Create an empty result structure for this infohash
+                        const result = {
+                            infohash: infohash,
+                            services: {}
+                        };
+                        
+                        // Search for entries with the matching infohash
+                        Object.entries(allData).forEach(([key, value]) => {
+                            if (key.startsWith(`${infohash}|`)) {
+                                // Extract the service name from the key
+                                const [_, entryService] = key.split('|');
+                                
+                                // If service is specified, only include matching service
+                                if (!service || service === entryService) {
+                                    // Create service data object and validate it
+                                    const serviceData = {
+                                        cached: value.cached === true || value.cached === false ? value.cached : null,
+                                        last_modified: value.last_modified && isValidISODate(value.last_modified) ? value.last_modified : null,
+                                        expiry: value.expiry && isValidISODate(value.expiry) ? value.expiry : null
+                                    };
+                                    
+                                    // Only add service if all fields are valid
+                                    if (serviceData.cached !== null && 
+                                        serviceData.last_modified !== null && 
+                                        serviceData.expiry !== null) {
+                                        // Add to services object using the service name as key
+                                        result.services[entryService] = serviceData;
+                                    }
+                                }
+                            }
+                        });
+                        
+                        // Only include results that have at least one valid service
+                        if (Object.keys(result.services).length > 0) {
+                            results[infohash] = {
+                                total: Object.keys(result.services).length,
+                                data: [result],
+                                schema_version: "2.0"
+                            };
+                        } else {
+                            // No valid services found for this infohash
+                            results[infohash] = {
+                                total: 0,
+                                data: [],
+                                schema_version: "2.0"
+                            };
+                        }
+                    });
+                    
+                    // If only one infohash was requested, maintain backward compatibility
+                    if (infohashes.length === 1) {
+                        const singleResult = results[infohashes[0]];
+                        if (singleResult.total === 0) {
+                            return sendResponse(404, { error: 'Data not found' });
+                        }
+                        return sendResponse(200, singleResult);
+                    }
+                    
+                    sendResponse(200, {
+                        total_hashes: infohashes.length,
+                        results: results,
+                        schema_version: "2.0"
+                    });
                 });
-            });
+            } catch (error) {
+                console.error('Error in /data/:infohash endpoint:', error);
+                sendResponse(500, { error: 'Internal server error' });
+            }
+        });
+
+        // Add invalidate data endpoint (protected)
+        this.app.delete('/data/:infohash', authenticateRequest, async (req, res) => {
+            if (!this.gun) {
+                return res.status(503).json({ error: 'Database not initialized' });
+            }
+
+            const infohash = req.params.infohash;
+            const service = req.query.service; // Optional service parameter
+
+            try {
+                const success = await this.invalidateData(infohash, service);
+                if (success) {
+                    res.json({ 
+                        status: 'success', 
+                        message: service 
+                            ? `Service ${service} invalidated for infohash ${infohash}` 
+                            : `Data invalidated for infohash ${infohash}` 
+                    });
+                } else {
+                    res.status(400).json({ error: 'Failed to invalidate data' });
+                }
+            } catch (error) {
+                console.error('Error in /data DELETE:', error);
+                res.status(500).json({ error: error.message });
+            }
         });
     }
 
@@ -621,7 +531,7 @@ class GunNode {
                 rtcConfig: {
                     iceServers: [
                         { urls: 'stun:stun.l.google.com:19302' },
-                        { urls: 'stun:stun1.l.google.com:19302' },
+                        { urls: 'stun1.l.google.com:19302' },
                         { urls: 'stun2.l.google.com:19302' },
                         {
                             urls: 'turn:openrelay.metered.ca:443',
@@ -654,12 +564,8 @@ class GunNode {
                 this.connectedWebRTCPeers.delete(peerUrl);
             });
 
-
             // Initialize the cache table
             this.cacheTable = this.gun.get('cache');
-
-            // Run migrations for existing data if needed
-            this.migrateUnderscoreToMigratePipe();
             
             console.log('Node initialized successfully');
             return true;
@@ -684,14 +590,11 @@ class GunNode {
 
     // Clean data object by removing Gun.js metadata
     cleanData(data) {
-        if (!data || typeof data !== 'object') return data;
+        if (!data || typeof data !== 'object') return null;
         
-        // Create a new object with only our expected properties
+        // Create a new object structure with services nested
         const cleaned = {
-            infohash: data.infohash,
-            service: data.provider || data.service || 'real_debrid',
-            last_modified: data.last_modified || null,
-            expiry: data.expiry || null
+            infohash: data.infohash
         };
 
         // If infohash contains a service suffix, extract just the infohash part
@@ -699,12 +602,44 @@ class GunNode {
             cleaned.infohash = cleaned.infohash.split('|')[0];
         }
 
-        // Explicitly preserve cached property if it exists
-        if (data.cached === true || data.cached === false) {
-            cleaned.cached = data.cached;
-        } else {
-            // Don't set a default - let validation handle missing fields
-            cleaned.cached = null;
+        // Return null if no valid infohash
+        if (!cleaned.infohash || typeof cleaned.infohash !== 'string') {
+            return null;
+        }
+
+        // Initialize services object, preserving existing services if they exist
+        cleaned.services = data.services || {};
+
+        // If we're dealing with legacy data (flat structure), convert it to services structure
+        if (!data.services) {
+            const serviceName = data.provider || data.service || 'default';
+            
+            // Create the service object
+            const serviceObj = {};
+            
+            // Add service data - only add if it's a valid boolean
+            if (data.cached === true || data.cached === false) {
+                serviceObj.cached = data.cached;
+            } else {
+                return null; // Invalid cached status
+            }
+            
+            // Only add if valid ISO date
+            if (data.last_modified && isValidISODate(data.last_modified)) {
+                serviceObj.last_modified = data.last_modified;
+            } else {
+                return null; // Invalid or missing last_modified
+            }
+            
+            // Only add if valid ISO date
+            if (data.expiry && isValidISODate(data.expiry)) {
+                serviceObj.expiry = data.expiry;
+            } else {
+                return null; // Invalid or missing expiry
+            }
+            
+            // Add the service object to the services property
+            cleaned.services[serviceName] = serviceObj;
         }
 
         return cleaned;
@@ -712,55 +647,133 @@ class GunNode {
 
     // Validate and fix schema to ensure all required fields are present
     validateAndFixSchema(data) {
+        // Check if we already have a nested services structure
+        if (data.services && typeof data.services === 'object') {
+            // New format - validate and fix services
+            const serviceNames = Object.keys(data.services);
+            
+            // Ensure at least one service exists
+            if (serviceNames.length === 0) {
+                data.services.default = {
+                    cached: false,
+                    last_modified: new Date().toISOString(),
+                    expiry: null
+                };
+            }
+            
+            // Validate each service
+            for (const serviceName of serviceNames) {
+                const service = data.services[serviceName];
+                
+                // Ensure service is an object
+                if (!service || typeof service !== 'object') {
+                    data.services[serviceName] = {
+                        cached: false,
+                        last_modified: new Date().toISOString(),
+                        expiry: null
+                    };
+                    continue;
+                }
+                
+                // Ensure cached status exists as a boolean
+                if (service.cached !== true && service.cached !== false) {
+                    console.warn(`Missing or invalid cached status in service ${serviceName}`);
+                    service.cached = false;
+                }
+                
+                // Ensure last_modified exists and is valid
+                if (!service.last_modified) {
+                    console.warn(`Missing last_modified in service ${serviceName}`);
+                    service.last_modified = new Date().toISOString();
+                } else if (!isValidISODate(service.last_modified)) {
+                    console.warn(`Invalid last_modified timestamp format in service ${serviceName}: ${service.last_modified}`);
+                    service.last_modified = new Date().toISOString();
+                }
+                
+                // Ensure expiry exists and is valid
+                if (!service.expiry) {
+                    console.warn(`Missing expiry in service ${serviceName}, calculating based on cached status`);
+                    const expiryDate = new Date(service.last_modified);
+                    if (service.cached === true) {
+                        expiryDate.setDate(expiryDate.getDate() + 7); // 7 days for cached=true
+                    } else {
+                        expiryDate.setHours(expiryDate.getHours() + 24); // 24 hours for cached=false
+                    }
+                    service.expiry = expiryDate.toISOString();
+                } else if (!isValidISODate(service.expiry)) {
+                    console.warn(`Invalid expiry timestamp format in service ${serviceName}: ${service.expiry}`);
+                    const expiryDate = new Date(service.last_modified);
+                    if (service.cached === true) {
+                        expiryDate.setDate(expiryDate.getDate() + 7);
+                    } else {
+                        expiryDate.setHours(expiryDate.getHours() + 24);
+                    }
+                    service.expiry = expiryDate.toISOString();
+                }
+            }
+            
+            return data;
+        }
+        
+        // Legacy format - transform to new format while validating
+        
         // Ensure infohash exists
         if (!data.infohash) {
             console.warn('Missing infohash in data object');
             data.infohash = 'unknown_' + Date.now();
         }
 
-        // Ensure service exists
-        if (!data.service) {
-            console.warn('Missing service in data object');
-            data.service = 'real_debrid';
-        }
+        // Extract service name or use default
+        const serviceName = data.service || 'default';
 
-        // Ensure cached status exists as a boolean
-        if (data.cached !== true && data.cached !== false) {
-            console.warn('Missing or invalid cached status in data object');
-            data.cached = false;
-        }
-
+        // Create services structure
+        const serviceData = {
+            cached: data.cached === true || data.cached === false ? data.cached : false
+        };
+        
         // Ensure last_modified exists and is valid
         if (!data.last_modified) {
             console.warn('Missing last_modified in data object');
-            data.last_modified = new Date().toISOString();
+            serviceData.last_modified = new Date().toISOString();
         } else if (!isValidISODate(data.last_modified)) {
             console.warn(`Invalid last_modified timestamp format: ${data.last_modified}`);
-            data.last_modified = new Date().toISOString();
+            serviceData.last_modified = new Date().toISOString();
+        } else {
+            serviceData.last_modified = data.last_modified;
         }
 
         // Ensure expiry exists and is valid
         if (!data.expiry) {
             console.warn('Missing expiry in data object, calculating based on cached status');
-            const expiryDate = new Date(data.last_modified);
-            if (data.cached === true) {
+            const expiryDate = new Date(serviceData.last_modified);
+            if (serviceData.cached === true) {
                 expiryDate.setDate(expiryDate.getDate() + 7); // 7 days for cached=true
             } else {
                 expiryDate.setHours(expiryDate.getHours() + 24); // 24 hours for cached=false
             }
-            data.expiry = expiryDate.toISOString();
+            serviceData.expiry = expiryDate.toISOString();
         } else if (!isValidISODate(data.expiry)) {
             console.warn(`Invalid expiry timestamp format: ${data.expiry}`);
-            const expiryDate = new Date(data.last_modified);
-            if (data.cached === true) {
+            const expiryDate = new Date(serviceData.last_modified);
+            if (serviceData.cached === true) {
                 expiryDate.setDate(expiryDate.getDate() + 7);
             } else {
                 expiryDate.setHours(expiryDate.getHours() + 24);
             }
-            data.expiry = expiryDate.toISOString();
+            serviceData.expiry = expiryDate.toISOString();
+        } else {
+            serviceData.expiry = data.expiry;
         }
 
-        return data;
+        // Create new object with nested services
+        const transformedData = {
+            infohash: data.infohash,
+            services: {
+                [serviceName]: serviceData
+            }
+        };
+
+        return transformedData;
     }
 
     // Validate schema without fixing issues - just returns true/false
@@ -772,38 +785,57 @@ class GunNode {
         }
         
         // Check infohash
-        if (!data.infohash) {
-            console.warn('Missing infohash in data object');
+        if (!data.infohash || typeof data.infohash !== 'string') {
+            console.warn('Missing or invalid infohash in data object');
             return false;
         }
         
-        // Check service
-        if (!data.service) {
-            console.warn('Missing service in data object');
+        // Check for services object
+        if (!data.services || typeof data.services !== 'object') {
+            console.warn('Missing or invalid services object');
             return false;
         }
         
-        // Check cached status is a boolean
-        if (data.cached !== true && data.cached !== false) {
-            console.warn('Missing or invalid cached status in data object');
+        // New schema format - verify at least one valid service entry exists
+        const serviceNames = Object.keys(data.services);
+        if (serviceNames.length === 0) {
+            console.warn('No services defined for infohash');
             return false;
         }
         
-        // Check last_modified exists and is valid format
-        if (!data.last_modified) {
-            console.warn('Missing last_modified in data object');
-            return false;
-        } else if (!isValidISODate(data.last_modified)) {
-            console.warn(`Invalid last_modified timestamp format: ${data.last_modified}`);
-            return false;
+        // Check if at least one service has valid data
+        let hasValidService = false;
+        for (const serviceName of serviceNames) {
+            const service = data.services[serviceName];
+            
+            // Check service data structure
+            if (!service || typeof service !== 'object') continue;
+            
+            // Check cached status is a boolean
+            if (service.cached !== true && service.cached !== false) {
+                console.warn(`Invalid cached status in service ${serviceName}`);
+                continue;
+            }
+            
+            // Check last_modified exists and is valid format
+            if (!service.last_modified || !isValidISODate(service.last_modified)) {
+                console.warn(`Invalid last_modified in service ${serviceName}`);
+                continue;
+            }
+            
+            // Check expiry exists and is valid format
+            if (!service.expiry || !isValidISODate(service.expiry)) {
+                console.warn(`Invalid expiry in service ${serviceName}`);
+                continue;
+            }
+            
+            // This service is valid
+            hasValidService = true;
+            break;
         }
         
-        // Check expiry exists and is valid format
-        if (!data.expiry) {
-            console.warn('Missing expiry in data object');
-            return false;
-        } else if (!isValidISODate(data.expiry)) {
-            console.warn(`Invalid expiry timestamp format: ${data.expiry}`);
+        if (!hasValidService) {
+            console.warn('No valid service found for infohash');
             return false;
         }
         
@@ -862,12 +894,6 @@ class GunNode {
                 throw new Error('Encryption not initialized');
             }
 
-            // Handle legacy unencrypted data format
-            if (!data.encryptedData && data.cached !== undefined) {
-                console.log('Found legacy unencrypted data, will be migrated on next update');
-                return this.cleanData(data);
-            }
-
             if (!data || !data.encryptedData) {
                 throw new Error('Invalid encrypted object');
             }
@@ -904,18 +930,13 @@ class GunNode {
                 return decrypted;
             }
         } catch (error) {
-            if (error.message === 'Invalid encrypted object' && data && data.cached !== undefined) {
-                // This is likely legacy data, log it once and return
-                console.log('Legacy data detected, will be migrated on next update');
-                return this.cleanData(data);
-            }
             console.error('SEA decryption error:', error);
             return null;
         }
     }
 
     // Get data with SEA decryption
-    async getData(key, callback, isCompositeKey = false) {
+    async getData(key, callback) {
         const startTime = Date.now();
         
         // Check the cache first
@@ -923,8 +944,14 @@ class GunNode {
             const cachedEntry = this.entryCache.get(key);
             // Check if the cached entry is still valid
             if (Date.now() < cachedEntry.expiry) {
-                callback(cachedEntry.data);
-                return;
+                // Validate the cached data
+                if (this.validateSchema(cachedEntry.data)) {
+                    callback(cachedEntry.data);
+                    return;
+                } else {
+                    // Remove invalid entry from cache
+                    this.entryCache.delete(key);
+                }
             } else {
                 // Remove expired entry
                 this.entryCache.delete(key);
@@ -939,28 +966,34 @@ class GunNode {
             }
 
             try {
-                // Make a copy of the raw data
-                const retrievedData = JSON.parse(JSON.stringify(data));
-                
-                if (!isCompositeKey && key.includes('|')) {
-                    // If this is a composite key, extract the infohash and service
-                    const [infohash, service] = key.split('|');
-                    retrievedData.infohash = infohash;
-                    retrievedData.service = service;
+                // Decrypt the data if it's encrypted
+                let decryptedData;
+                if (data.encryptedData) {
+                    decryptedData = await this.decrypt(data);
+                    if (!decryptedData) {
+                        console.warn(`Failed to decrypt data for key: ${key}`);
+                        callback(null);
+                        return;
+                    }
                 } else {
-                    // Otherwise just add the infohash
-                    retrievedData.infohash = key;
+                    // Make a copy of the raw data for legacy support
+                    decryptedData = JSON.parse(JSON.stringify(data));
                 }
                 
-                // Check if data exists
-                if (!retrievedData.last_modified) {
+                // Add the infohash if not present
+                if (!decryptedData.infohash) {
+                    decryptedData.infohash = key;
+                }
+                
+                // Clean the data before returning
+                const cleanedData = this.cleanData(decryptedData);
+                
+                // Only proceed if we have valid data
+                if (!cleanedData || !this.validateSchema(cleanedData)) {
                     console.warn(`Invalid data format for key: ${key}`);
                     callback(null);
                     return;
                 }
-                
-                // Clean the data before returning
-                const cleanedData = this.cleanData(retrievedData);
                 
                 // Store in cache
                 this.entryCache.set(key, {
@@ -976,27 +1009,23 @@ class GunNode {
         });
     }
 
-    // New method to get data by infohash and service
-    async getDataByInfohashAndService(infohash, service, callback) {
-        const compositeKey = `${infohash}|${service}`;
-        this.getData(compositeKey, callback, true);
-    }
-
     // Get all data with SEA decryption
     getAllData(callback) {
         const allData = {};
         let receivedCount = 0;
         let lastReceived = Date.now();
+        let pendingDecryptions = 0;
         
         // Set a timeout to ensure we don't wait forever
         const maxWaitTime = 3000; // 3 seconds max wait
         const startTime = Date.now();
         
         // We'll consider data collection complete if no new data 
-        // has been received for 500ms, or we hit the max wait time
+        // has been received for 500ms, or we hit the max wait time,
+        // and all decryptions are complete
         const checkComplete = () => {
             const now = Date.now();
-            if ((now - lastReceived > 500 && receivedCount > 0) || (now - startTime > maxWaitTime)) {
+            if (((now - lastReceived > 500 && receivedCount > 0) || (now - startTime > maxWaitTime)) && pendingDecryptions === 0) {
                 callback(allData);
                 return true;
             }
@@ -1007,67 +1036,112 @@ class GunNode {
             if (checkComplete()) {
                 clearInterval(intervalId);
             }
-        }, 500); // Reduced interval frequency to avoid log spam
+        }, 500);
         
-        this.cacheTable.map().once((data, hash) => {
+        this.cacheTable.map().once(async (data, hash) => {
             if (data) {
-                allData[hash] = data;
-                receivedCount++;
-                lastReceived = Date.now();
+                try {
+                    pendingDecryptions++;
+                    // Decrypt the data if it's encrypted
+                    let decryptedData;
+                    if (data.encryptedData) {
+                        decryptedData = await this.decrypt(data);
+                        if (!decryptedData) {
+                            console.warn(`Failed to decrypt data for hash: ${hash}`);
+                            pendingDecryptions--;
+                            return;
+                        }
+                    } else {
+                        // Make a copy of the raw data for legacy support
+                        decryptedData = JSON.parse(JSON.stringify(data));
+                    }
+                    
+                    // Add the hash as infohash if not present
+                    if (!decryptedData.infohash) {
+                        decryptedData.infohash = hash;
+                    }
+                    
+                    allData[hash] = decryptedData;
+                    receivedCount++;
+                    lastReceived = Date.now();
+                } catch (error) {
+                    console.error(`Error processing data for hash ${hash}:`, error);
+                } finally {
+                    pendingDecryptions--;
+                    // Check if we're done after this decryption
+                    if (checkComplete()) {
+                        clearInterval(intervalId);
+                    }
+                }
             }
         });
     }
 
     // Set data with SEA encryption
     async setData(infohash, data) {
-        // Create a new data object with direct property assignment
+        // First get existing data if any
+        const existingData = await new Promise((resolve) => {
+            this.getData(infohash, (result) => {
+                resolve(result);
+            });
+        });
+
+        // Extract the service name (default to 'default' if not specified)
+        const serviceName = data.provider || data.service || 'default';
+        
+        // Create or update the data object with nested services structure
         const processedData = {
             infohash: infohash,
-            service: data.provider || data.service || 'real_debrid',
+            services: existingData ? {...existingData.services} : {}
+        };
+        
+        // Create the service data object
+        const serviceData = {
+            cached: data.cached === true || data.cached === false ? data.cached : false,
             last_modified: data.last_modified || new Date().toISOString()
         };
         
-        // Create a composite key
-        const compositeKey = `${infohash}|${processedData.service}`;
-        
-        // Directly preserve cached without logic
-        if (data.cached === true) {
-            processedData.cached = true;
-        } else if (data.cached === false) {
-            processedData.cached = false;
-        }
-        
         // Handle timestamp formatting
-        if (!processedData.last_modified.endsWith('Z')) {
-            processedData.last_modified = new Date(processedData.last_modified).toISOString();
+        if (!serviceData.last_modified.endsWith('Z')) {
+            serviceData.last_modified = new Date(serviceData.last_modified).toISOString();
         }
         
         // Directly use expiry if provided, otherwise calculate based on cached
         if (data.expiry) {
-            processedData.expiry = data.expiry.endsWith('Z') 
+            serviceData.expiry = data.expiry.endsWith('Z') 
                 ? data.expiry 
                 : new Date(data.expiry).toISOString();
-        } else if (processedData.cached === true) {
+        } else if (serviceData.cached === true) {
             // Only calculate if not provided
-            const expiryDate = new Date(processedData.last_modified);
+            const expiryDate = new Date(serviceData.last_modified);
             expiryDate.setDate(expiryDate.getDate() + 7); // 7 days for cached=true
-            processedData.expiry = expiryDate.toISOString();
-        } else if (processedData.cached === false) {
+            serviceData.expiry = expiryDate.toISOString();
+        } else {
             // Only calculate if not provided
-            const expiryDate = new Date(processedData.last_modified);
+            const expiryDate = new Date(serviceData.last_modified);
             expiryDate.setHours(expiryDate.getHours() + 24); // 24 hours for cached=false
-            processedData.expiry = expiryDate.toISOString();
+            serviceData.expiry = expiryDate.toISOString();
         }
 
-        // Update or invalidate the cache for this key
-        if (this.entryCache.has(compositeKey)) {
+        // Add or update the service data in the nested structure
+        processedData.services[serviceName] = serviceData;
+
+        // Update or invalidate the cache for this infohash
+        if (this.entryCache.has(infohash)) {
             // Remove from cache - we'll update it on next retrieval
-            this.entryCache.delete(compositeKey);
-            console.log(`Cache entry invalidated for key: ${compositeKey} (data updated)`);
+            this.entryCache.delete(infohash);
+            console.log(`Cache entry invalidated for infohash: ${infohash} (data updated)`);
+        }
+
+        // Encrypt the processed data
+        const encryptedData = await this.encrypt(processedData);
+        if (!encryptedData) {
+            console.error('Failed to encrypt data');
+            return false;
         }
 
         return new Promise((resolve) => {
-            this.cacheTable.get(compositeKey).put(processedData, (ack) => {
+            this.cacheTable.get(infohash).put(encryptedData, (ack) => {
                 if (ack.err) {
                     console.error('Error storing data:', ack.err);
                     resolve(false);
@@ -1084,133 +1158,146 @@ class GunNode {
         
         return new Promise((resolve) => {
             this.getAllData((allData) => {
-                let entries = Object.entries(allData)
-                    .map(([key, data]) => {
-                        // Parse the composite key to get infohash and service
-                        let infohash, service;
-                        if (key.includes('|')) {
-                            [infohash, service] = key.split('|');
-                        } else {
-                            infohash = key;
-                            service = data.service;
+                // Process all data entries
+                const processedEntries = Object.entries(allData)
+                    .map(([infohash, data]) => {
+                        // Skip if no services or invalid data
+                        if (!data || !data.services || typeof data.services !== 'object') {
+                            return null;
                         }
-                        
-                        // Create entry with parsed data
-                        const cleanedData = this.cleanData(data);
+
+                        // Process each service entry
+                        const validServices = {};
+                        let newestTimestamp = 0;
+
+                        Object.entries(data.services).forEach(([serviceName, serviceData]) => {
+                            // Validate service data
+                            if (serviceData.cached !== true && serviceData.cached !== false) return;
+                            if (!serviceData.last_modified || !isValidISODate(serviceData.last_modified)) return;
+                            if (!serviceData.expiry || !isValidISODate(serviceData.expiry)) return;
+
+                            // Add valid service data
+                            validServices[serviceName] = serviceData;
+
+                            // Track newest timestamp
+                            const timestamp = new Date(serviceData.last_modified).getTime();
+                            if (timestamp > newestTimestamp) {
+                                newestTimestamp = timestamp;
+                            }
+                        });
+
+                        // Skip if no valid services
+                        if (Object.keys(validServices).length === 0) {
+                            return null;
+                        }
+
                         return {
                             infohash,
-                            service,
-                            ...cleanedData
+                            services: validServices,
+                            newest_timestamp: newestTimestamp
                         };
-                    });
-                
+                    })
+                    .filter(entry => entry !== null); // Remove invalid entries
+
                 // Apply timestamp filters if provided
+                let filteredEntries = processedEntries;
                 if (minTimestamp) {
-                    entries = entries.filter(entry => 
-                        entry.last_modified && new Date(entry.last_modified) >= new Date(minTimestamp)
+                    filteredEntries = filteredEntries.filter(entry => 
+                        entry.newest_timestamp >= new Date(minTimestamp).getTime()
                     );
                 }
                 
                 if (maxTimestamp) {
-                    entries = entries.filter(entry => 
-                        entry.last_modified && new Date(entry.last_modified) <= new Date(maxTimestamp)
+                    filteredEntries = filteredEntries.filter(entry => 
+                        entry.newest_timestamp <= new Date(maxTimestamp).getTime()
                     );
                 }
                 
                 // Apply any additional filter properties
                 if (Object.keys(filter).length > 0) {
-                    entries = entries.filter(entry => {
-                        return Object.entries(filter).every(([key, value]) => {
-                            return entry[key] === value;
+                    filteredEntries = filteredEntries.filter(entry => {
+                        // For service-specific filters, check all services
+                        return Object.values(entry.services).some(serviceData => {
+                            return Object.entries(filter).every(([key, value]) => {
+                                if (key === 'cached' || key === 'last_modified' || key === 'expiry') {
+                                    return serviceData[key] === value;
+                                }
+                                return entry[key] === value;
+                            });
                         });
                     });
                 }
-                
-                // IMPORTANT: Force explicit last_modified sorting - newest first
-                entries.sort((a, b) => {
-                    // Parse timestamps to ensure consistent comparison
-                    const dateA = a.last_modified ? new Date(a.last_modified).getTime() : 0;
-                    const dateB = b.last_modified ? new Date(b.last_modified).getTime() : 0;
-                    // Sort descending (newest first)
-                    return dateB - dateA;
+
+                // Sort by newest timestamp and apply limit
+                filteredEntries.sort((a, b) => b.newest_timestamp - a.newest_timestamp);
+                filteredEntries = filteredEntries.slice(0, limit);
+
+                // Remove the temporary newest_timestamp field
+                filteredEntries.forEach(entry => {
+                    delete entry.newest_timestamp;
                 });
-                
-                // Apply limit after sorting
-                entries = entries.slice(0, limit);
 
                 resolve({
-                    total: entries.length,
+                    total: filteredEntries.length,
                     limit,
-                    data: entries
+                    data: filteredEntries,
+                    schema_version: "2.0"
                 });
             });
         });
     }
 
-    // Migrate data from underscore separator to pipe separator
-    async migrateUnderscoreToMigratePipe() {
-        console.log('Checking for data migration from underscore to pipe separator...');
-        const migratedKeys = [];
-        
-        // Get all data to check for keys with underscores
-        await new Promise((resolve) => {
-            this.getAllData((allData) => {
-                // Process each key
-                Object.entries(allData).forEach(async ([key, data]) => {
-                    // Only process keys that have underscores and don't have pipes
-                    if (key.includes('_') && !key.includes('|')) {
-                        try {
-                            // Extract the parts using old format
-                            const [infohash, service] = key.split('_');
-                            
-                            // Skip if the split doesn't result in expected parts
-                            if (!infohash || !service) return;
-                            
-                            // Create new key with pipe format
-                            const newKey = `${infohash}|${service}`;
-                            
-                            // Store the data with the new key format
-                            const success = await new Promise((resolveStore) => {
-                                this.cacheTable.get(newKey).put(data, (ack) => {
-                                    if (ack.err) {
-                                        console.error(`Error migrating data from ${key} to ${newKey}:`, ack.err);
-                                        resolveStore(false);
-                                    } else {
-                                        console.log(`Migrated data from ${key} to ${newKey}`);
-                                        migratedKeys.push(key);
-                                        resolveStore(true);
-                                    }
-                                });
-                            });
-                            
-                            // If successfully stored with new key, remove the old key
-                            if (success) {
-                                await new Promise((resolveRemove) => {
-                                    this.cacheTable.get(key).put(null, (ack) => {
-                                        if (ack.err) {
-                                            console.error(`Error removing old key ${key}:`, ack.err);
-                                        } else {
-                                            console.log(`Removed old key ${key}`);
-                                        }
-                                        resolveRemove();
-                                    });
-                                });
-                            }
-                        } catch (error) {
-                            console.error(`Error during migration for key ${key}:`, error);
+    // Invalidate specific infohash data
+    async invalidateData(infohash, service = null) {
+        try {
+            if (!infohash) {
+                throw new Error('Infohash is required');
+            }
+
+            // If service is specified, only invalidate that service
+            if (service) {
+                // Get existing data first
+                const existingData = await new Promise((resolve) => {
+                    this.getData(infohash, (result) => {
+                        resolve(result);
+                    });
+                });
+
+                if (existingData && existingData.services) {
+                    // Remove only the specified service
+                    if (existingData.services[service]) {
+                        delete existingData.services[service];
+                        
+                        // If there are still other services, update the data
+                        if (Object.keys(existingData.services).length > 0) {
+                            return await this.setData(infohash, existingData);
                         }
                     }
-                });
-                
-                if (migratedKeys.length > 0) {
-                    console.log(`Migration complete. Migrated ${migratedKeys.length} keys to pipe separator format.`);
-                } else {
-                    console.log('No keys needed migration.');
                 }
-                
-                resolve();
+            }
+
+            // Remove from local cache if present
+            if (this.entryCache.has(infohash)) {
+                this.entryCache.delete(infohash);
+                console.log(`Cache entry invalidated for infohash: ${infohash}`);
+            }
+
+            // Use Gun's null operation to remove the data
+            return new Promise((resolve) => {
+                this.cacheTable.get(infohash).put(null, (ack) => {
+                    if (ack.err) {
+                        console.error('Error invalidating data:', ack.err);
+                        resolve(false);
+                    } else {
+                        console.log(`Data invalidated for infohash: ${infohash}`);
+                        resolve(true);
+                    }
+                });
             });
-        });
+        } catch (error) {
+            console.error('Error in invalidateData:', error);
+            return false;
+        }
     }
 }
 
@@ -1264,4 +1351,4 @@ console.log(`Type: SEA (Security, Encryption, Authorization)`);
 console.log(`Algorithm: AES-GCM (via SEA)`);
 console.log(`Key Status: ${ENCRYPTION_KEY ? 'Configured' : 'Missing'}`);
 console.log(`Encryption: ${ENCRYPTION_KEY ? 'Enabled' : 'Disabled'}`);
-console.log('==================\n'); 
+console.log('==================\n');
