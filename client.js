@@ -400,77 +400,70 @@ class GunNode {
                     return;
                 }
                 
-                // For multiple infohashes or no service specified, use existing getAllData approach
-                this.getAllData((allData) => {
-                    if (hasResponded) return; // Skip if we've already responded
-                    
-                    const results = {};
-                    
-                    infohashes.forEach(infohash => {
-                        // Create an empty result structure for this infohash
-                        const result = {
-                            infohash: infohash,
-                            services: {}
-                        };
+                // For multiple infohashes, fetch them in parallel
+                const results = {};
+                let completedQueries = 0;
+                
+                infohashes.forEach(infohash => {
+                    this.getData(infohash, (data) => {
+                        completedQueries++;
                         
-                        // Search for entries with the matching infohash
-                        Object.entries(allData).forEach(([key, value]) => {
-                            if (key.startsWith(`${infohash}|`)) {
-                                // Extract the service name from the key
-                                const [_, entryService] = key.split('|');
-                                
-                                // If service is specified, only include matching service
-                                if (!service || service === entryService) {
-                                    // Create service data object and validate it
-                                    const serviceData = {
-                                        cached: value.cached === true || value.cached === false ? value.cached : null,
-                                        last_modified: value.last_modified && isValidISODate(value.last_modified) ? value.last_modified : null,
-                                        expiry: value.expiry && isValidISODate(value.expiry) ? value.expiry : null
+                        if (data) {
+                            // If service is specified, filter the services
+                            if (service && data.services) {
+                                const serviceData = data.services[service];
+                                if (serviceData) {
+                                    results[infohash] = {
+                                        total: 1,
+                                        data: [{
+                                            infohash: data.infohash,
+                                            services: {
+                                                [service]: serviceData
+                                            }
+                                        }],
+                                        schema_version: "2.0"
                                     };
-                                    
-                                    // Only add service if all fields are valid
-                                    if (serviceData.cached !== null && 
-                                        serviceData.last_modified !== null && 
-                                        serviceData.expiry !== null) {
-                                        // Add to services object using the service name as key
-                                        result.services[entryService] = serviceData;
-                                    }
+                                } else {
+                                    results[infohash] = {
+                                        total: 0,
+                                        data: [],
+                                        schema_version: "2.0"
+                                    };
                                 }
+                            } else {
+                                // Include all services
+                                results[infohash] = {
+                                    total: Object.keys(data.services).length,
+                                    data: [data],
+                                    schema_version: "2.0"
+                                };
                             }
-                        });
-                        
-                        // Only include results that have at least one valid service
-                        if (Object.keys(result.services).length > 0) {
-                            results[infohash] = {
-                                total: Object.keys(result.services).length,
-                                data: [result],
-                                schema_version: "2.0"
-                            };
                         } else {
-                            // No valid services found for this infohash
                             results[infohash] = {
                                 total: 0,
                                 data: [],
                                 schema_version: "2.0"
                             };
                         }
-                    });
-                    
-                    // If only one infohash was requested, maintain backward compatibility
-                    if (infohashes.length === 1) {
-                        const singleResult = results[infohashes[0]];
-                        if (singleResult.total === 0) {
-                            return sendResponse(404, { error: 'Data not found' });
+                        
+                        // If all queries are complete, send the response
+                        if (completedQueries === infohashes.length) {
+                            sendResponse(200, {
+                                total_hashes: infohashes.length,
+                                results: results,
+                                schema_version: "2.0"
+                            });
                         }
-                        return sendResponse(200, singleResult);
-                    }
-                    
-                    sendResponse(200, {
-                        total_hashes: infohashes.length,
-                        results: results,
-                        schema_version: "2.0"
                     });
                 });
+                
+                // Set a timeout to ensure we don't wait forever
+                setTimeout(() => {
+                    if (!hasResponded) {
+                        sendResponse(408, { error: 'Request timeout while fetching data' });
+                    }
+                }, 5000); // 5 second timeout
+                
             } catch (error) {
                 console.error('Error in /data/:infohash endpoint:', error);
                 sendResponse(500, { error: 'Internal server error' });
