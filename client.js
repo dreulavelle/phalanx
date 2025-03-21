@@ -273,38 +273,41 @@ class GunNode {
                 }
             });
 
-            let dataCount = 0;
-            let validCount = 0;
+            // Get data count using the graph-based method (Method 2)
+            const graph = this.gun._.graph;
+            const dataCount = Object.entries(graph).filter(([key, value]) => {
+                return key.startsWith('cache/') && 
+                       key !== 'cache' && 
+                       value !== null && 
+                       typeof value === 'object';
+            }).length;
 
-            // Get data count using the same validation logic as /data endpoint
-            await new Promise((resolve) => {
-                this.getAllData((allData) => {
-                    dataCount = Object.keys(allData).length;
-                    
-                    // Count valid entries using the same logic as /data endpoint
-                    Object.values(allData).forEach(data => {
-                        if (data && data.services && typeof data.services === 'object') {
-                            // Check if at least one service has valid data
-                            const hasValidService = Object.values(data.services).some(service => {
-                                return (
-                                    service &&
-                                    typeof service === 'object' &&
-                                    (service.cached === true || service.cached === false) &&
-                                    service.last_modified &&
-                                    isValidISODate(service.last_modified) &&
-                                    service.expiry &&
-                                    isValidISODate(service.expiry)
-                                );
-                            });
-                            
-                            if (hasValidService) {
-                                validCount++;
-                            }
-                        }
-                    });
-                    resolve();
-                });
-            });
+            // For valid count, check entries that have either encryptedData or valid services
+            const validCount = Object.entries(graph)
+                .filter(([key, value]) => {
+                    if (!key.startsWith('cache/') || key === 'cache' || !value || typeof value !== 'object') {
+                        return false;
+                    }
+                    // Check if it's an encrypted entry
+                    if (value.encryptedData) {
+                        return true;
+                    }
+                    // Check if it has valid services
+                    if (value.services && typeof value.services === 'object') {
+                        return Object.values(value.services).some(service => {
+                            return (
+                                service &&
+                                typeof service === 'object' &&
+                                (service.cached === true || service.cached === false) &&
+                                service.last_modified &&
+                                isValidISODate(service.last_modified) &&
+                                service.expiry &&
+                                isValidISODate(service.expiry)
+                            );
+                        });
+                    }
+                    return false;
+                }).length;
             
             res.json({
                 node: {
@@ -325,7 +328,8 @@ class GunNode {
                 },
                 data: {
                     total: dataCount,
-                    valid: validCount
+                    valid: validCount,
+                    graph_size: Object.keys(graph).length  // Added for verification
                 },
                 encryption: {
                     enabled: !!ENCRYPTION_KEY,
@@ -496,6 +500,129 @@ class GunNode {
                 res.status(500).json({ error: error.message });
             }
         });
+
+        // Add test counting endpoint
+        this.app.get('/test-count', authenticateRequest, async (req, res) => {
+            if (!this.gun) {
+                return res.status(503).json({ error: 'Database not initialized' });
+            }
+
+            const counts = {
+                method1: 0,  // Direct map count
+                method2: 0,  // Path-based count
+                method3: 0,  // Node traversal count
+                timing: {}
+            };
+
+            try {
+                // Method 1: Direct map count
+                const startMethod1 = Date.now();
+                await new Promise((resolve) => {
+                    let seen = new Set();
+                    this.cacheTable.map().on((data, key) => {
+                        if (!seen.has(key) && data !== null && data !== undefined) {
+                            counts.method1++;
+                            seen.add(key);
+                        }
+                    });
+                    
+                    // Force resolution after 3 seconds
+                    setTimeout(resolve, 3000);
+                });
+                counts.timing.method1 = Date.now() - startMethod1;
+
+                // Method 2: Path-based count using Gun's back() chain
+                const startMethod2 = Date.now();
+                const graph = this.gun._.graph;
+                const cacheEntries = Object.entries(graph).filter(([key, value]) => {
+                    return key.startsWith('cache/') && 
+                           key !== 'cache' && 
+                           value !== null && 
+                           typeof value === 'object';
+                });
+                counts.method2 = cacheEntries.length;
+                
+                // Additional graph analysis
+                const graphAnalysis = {
+                    total_nodes: Object.keys(graph).length,
+                    cache_prefix_nodes: cacheEntries.length,
+                    root_cache_node: graph['cache'] ? 1 : 0,
+                    null_nodes: Object.values(graph).filter(v => v === null).length,
+                    non_object_nodes: Object.values(graph).filter(v => v !== null && typeof v !== 'object').length
+                };
+                counts.timing.method2 = Date.now() - startMethod2;
+
+                // Method 3: Node validation with detailed counting
+                const startMethod3 = Date.now();
+                const validation = {
+                    total_processed: 0,
+                    invalid_structure: 0,
+                    missing_required_fields: 0,
+                    valid_entries: 0
+                };
+                
+                await new Promise((resolve) => {
+                    let processed = new Set();
+                    this.cacheTable.map().once((data, key) => {
+                        validation.total_processed++;
+                        
+                        if (!processed.has(key) && data !== null) {
+                            // Basic structure check
+                            if (!data || typeof data !== 'object') {
+                                validation.invalid_structure++;
+                                return;
+                            }
+                            
+                            // Check for required fields
+                            if (!data.encryptedData && !data.services && !data.infohash) {
+                                validation.missing_required_fields++;
+                                return;
+                            }
+                            
+                            counts.method3++;
+                            validation.valid_entries++;
+                            processed.add(key);
+                        }
+                    });
+                    
+                    // Force resolution after 3 seconds
+                    setTimeout(resolve, 3000);
+                });
+                counts.timing.method3 = Date.now() - startMethod3;
+
+                // Enhanced diagnostics
+                const diagnostics = {
+                    gun_stats: {
+                        graph_size: Object.keys(graph).length,
+                        graph_keys: Object.keys(graph).slice(0, 5),
+                        graph_analysis: graphAnalysis
+                    },
+                    cache_table: {
+                        exists: !!this.cacheTable,
+                        path: this.cacheTable ? this.cacheTable._.path : null
+                    },
+                    radisk: {
+                        enabled: this.gun._.opt.radisk,
+                        file: this.gun._.opt.file
+                    },
+                    validation_details: validation
+                };
+
+                res.json({
+                    counts,
+                    diagnostics,
+                    timestamp: new Date().toISOString()
+                });
+
+            } catch (error) {
+                console.error('Error in test-count endpoint:', error);
+                res.status(500).json({ 
+                    error: 'Internal server error',
+                    details: error.message,
+                    partial_counts: counts
+                });
+            }
+        });
     }
 
     async initialize() {
@@ -559,6 +686,44 @@ class GunNode {
 
             // Initialize the cache table
             this.cacheTable = this.gun.get('cache');
+
+            // Wait for initial data load and perform count
+            console.log('Waiting for data to load...');
+            await new Promise((resolve) => {
+                let checkCount = 0;
+                const maxChecks = 20; // Increased to 10 seconds total
+                let seen = new Set();
+                let lastCount = 0;
+                
+                // First, trigger data loading using map()
+                this.cacheTable.map().on((data, key) => {
+                    if (!seen.has(key) && data !== null && data !== undefined) {
+                        seen.add(key);
+                    }
+                });
+
+                const checkInterval = setInterval(() => {
+                    checkCount++;
+                    const graph = this.gun._.graph;
+                    const dataCount = Object.entries(graph).filter(([key, value]) => {
+                        return key.startsWith('cache/') && 
+                               key !== 'cache' && 
+                               value !== null && 
+                               typeof value === 'object';
+                    }).length;
+
+                    // Log progress if count changed
+                    if (dataCount !== lastCount) {
+                        lastCount = dataCount;
+                    }
+
+                    // If we have stable data or reached max checks, proceed
+                    if ((dataCount > 0 && dataCount === lastCount) || checkCount >= maxChecks) {
+                        clearInterval(checkInterval);
+                        resolve();
+                    }
+                }, 500); // Check every 500ms
+            });
             
             console.log('Node initialized successfully');
             return true;
