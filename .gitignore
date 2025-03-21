@@ -32,3 +32,9 @@ run_null_operation.sh
 backups
 clear_data.js
 node-data.json*
+phalanx-db.json-cache*
+!
+%1C
+cache%*
+data.json
+phalanx-db.json

@@ -1,4 +1,4 @@
-const Gun = require('gun');
+const Gun = require('gun');  // Use standard Gun import
 require('gun/lib/webrtc');  // Add WebRTC support
 require('gun/sea');  // Add SEA support
 const express = require('express');
@@ -71,6 +71,7 @@ class GunNode {
         this.lastSyncTime = null;
         this.startupTime = new Date(); // Track when this node started
         this.seenEntries = new Set(); // Track entries we've already seen
+        this.startupCount = 0; // Add startup count property
         this.config = {
             isRemoteServer: config.isRemoteServer || false,
             connectToRemote: !config.isRemoteServer && (config.connectToRemote || false),
@@ -78,10 +79,6 @@ class GunNode {
             peers: [] // Will be populated dynamically
         };
         this.pair = null; // Will store SEA key pair
-        
-        // Add a simple in-memory cache for frequently accessed entries
-        this.entryCache = new Map();
-        this.entryCacheTTL = 60000; // 60 seconds cache TTL
     }
 
     setupExpress() {
@@ -327,6 +324,7 @@ class GunNode {
                     file: this.gun._.opt.file || null
                 },
                 data: {
+                    startup_count: this.startupCount,
                     total: dataCount,
                     valid: validCount,
                     graph_size: Object.keys(graph).length  // Added for verification
@@ -640,9 +638,10 @@ class GunNode {
             this.gun = Gun({
                 web: server,
                 peers: this.config.peers,
-                file: 'node-data.json',
-                radisk: true,
-                multicast: false,
+                file: 'phalanx-db.json',  // File storage location
+                radisk: true,             // Enable RAD storage
+                localStorage: false,       // Disable localStorage in Node.js
+                multicast: false,         // Disable multicast for better performance
                 retry: 2000,
                 pid: NODE_ID,
                 super: this.config.isRemoteServer,
@@ -662,68 +661,13 @@ class GunNode {
                 }
             });
 
-            // Track peer connections
-            this.gun.on('hi', peer => {
-                const peerUrl = peer.url || peer.id;
-                
-                // Check if this is a WebRTC peer
-                if (peer.url && peer.url.startsWith('http')) {
-                    // This is a relay server
-                    this.connectedPeers.add(peerUrl);
-                } else {
-                    // This is likely a WebRTC peer
-                    this.connectedWebRTCPeers.add(peerUrl);
-                }
-            });
-
-            this.gun.on('bye', peer => {
-                const peerUrl = peer.url || peer.id;
-                
-                // Remove from both sets (only one removal will actually happen)
-                this.connectedPeers.delete(peerUrl);
-                this.connectedWebRTCPeers.delete(peerUrl);
-            });
-
             // Initialize the cache table
             this.cacheTable = this.gun.get('cache');
 
-            // Wait for initial data load and perform count
-            console.log('Waiting for data to load...');
-            await new Promise((resolve) => {
-                let checkCount = 0;
-                const maxChecks = 20; // Increased to 10 seconds total
-                let seen = new Set();
-                let lastCount = 0;
-                
-                // First, trigger data loading using map()
-                this.cacheTable.map().on((data, key) => {
-                    if (!seen.has(key) && data !== null && data !== undefined) {
-                        seen.add(key);
-                    }
-                });
-
-                const checkInterval = setInterval(() => {
-                    checkCount++;
-                    const graph = this.gun._.graph;
-                    const dataCount = Object.entries(graph).filter(([key, value]) => {
-                        return key.startsWith('cache/') && 
-                               key !== 'cache' && 
-                               value !== null && 
-                               typeof value === 'object';
-                    }).length;
-
-                    // Log progress if count changed
-                    if (dataCount !== lastCount) {
-                        lastCount = dataCount;
-                    }
-
-                    // If we have stable data or reached max checks, proceed
-                    if ((dataCount > 0 && dataCount === lastCount) || checkCount >= maxChecks) {
-                        clearInterval(checkInterval);
-                        resolve();
-                    }
-                }, 500); // Check every 500ms
-            });
+            // Get initial count
+            console.log('Getting initial database count...');
+            this.startupCount = await this.getStartupCount();
+            console.log(`Initial database count: ${this.startupCount}`);
             
             console.log('Node initialized successfully');
             return true;
@@ -748,7 +692,10 @@ class GunNode {
 
     // Clean data object by removing Gun.js metadata
     cleanData(data) {
-        if (!data || typeof data !== 'object') return null;
+        if (!data || typeof data !== 'object') {
+            console.warn('cleanData: Input is not an object');
+            return null;
+        }
         
         // Create a new object structure with services nested
         const cleaned = {
@@ -762,6 +709,7 @@ class GunNode {
 
         // Return null if no valid infohash
         if (!cleaned.infohash || typeof cleaned.infohash !== 'string') {
+            console.warn('cleanData: Missing or invalid infohash');
             return null;
         }
 
@@ -770,6 +718,7 @@ class GunNode {
 
         // If we're dealing with legacy data (flat structure), convert it to services structure
         if (!data.services) {
+            console.log('cleanData: Converting legacy data structure');
             const serviceName = data.provider || data.service || 'default';
             
             // Create the service object
@@ -779,6 +728,7 @@ class GunNode {
             if (data.cached === true || data.cached === false) {
                 serviceObj.cached = data.cached;
             } else {
+                console.warn('cleanData: Invalid cached status in legacy data');
                 return null; // Invalid cached status
             }
             
@@ -786,6 +736,7 @@ class GunNode {
             if (data.last_modified && isValidISODate(data.last_modified)) {
                 serviceObj.last_modified = data.last_modified;
             } else {
+                console.warn('cleanData: Invalid or missing last_modified in legacy data');
                 return null; // Invalid or missing last_modified
             }
             
@@ -793,6 +744,7 @@ class GunNode {
             if (data.expiry && isValidISODate(data.expiry)) {
                 serviceObj.expiry = data.expiry;
             } else {
+                console.warn('cleanData: Invalid or missing expiry in legacy data');
                 return null; // Invalid or missing expiry
             }
             
@@ -938,26 +890,26 @@ class GunNode {
     validateSchema(data) {
         // Check if all required fields exist and are valid
         if (!data || typeof data !== 'object') {
-            console.warn('Invalid data object');
+            console.warn('validateSchema: Invalid data object - not an object');
             return false;
         }
         
         // Check infohash
         if (!data.infohash || typeof data.infohash !== 'string') {
-            console.warn('Missing or invalid infohash in data object');
+            console.warn('validateSchema: Missing or invalid infohash');
             return false;
         }
         
         // Check for services object
         if (!data.services || typeof data.services !== 'object') {
-            console.warn('Missing or invalid services object');
+            console.warn('validateSchema: Missing or invalid services object');
             return false;
         }
         
         // New schema format - verify at least one valid service entry exists
         const serviceNames = Object.keys(data.services);
         if (serviceNames.length === 0) {
-            console.warn('No services defined for infohash');
+            console.warn('validateSchema: No services defined for infohash');
             return false;
         }
         
@@ -967,23 +919,26 @@ class GunNode {
             const service = data.services[serviceName];
             
             // Check service data structure
-            if (!service || typeof service !== 'object') continue;
+            if (!service || typeof service !== 'object') {
+                console.warn(`validateSchema: Invalid service object for ${serviceName}`);
+                continue;
+            }
             
             // Check cached status is a boolean
             if (service.cached !== true && service.cached !== false) {
-                console.warn(`Invalid cached status in service ${serviceName}`);
+                console.warn(`validateSchema: Invalid cached status in service ${serviceName}`);
                 continue;
             }
             
             // Check last_modified exists and is valid format
             if (!service.last_modified || !isValidISODate(service.last_modified)) {
-                console.warn(`Invalid last_modified in service ${serviceName}`);
+                console.warn(`validateSchema: Invalid last_modified in service ${serviceName}: ${service.last_modified}`);
                 continue;
             }
             
             // Check expiry exists and is valid format
             if (!service.expiry || !isValidISODate(service.expiry)) {
-                console.warn(`Invalid expiry in service ${serviceName}`);
+                console.warn(`validateSchema: Invalid expiry in service ${serviceName}: ${service.expiry}`);
                 continue;
             }
             
@@ -993,7 +948,7 @@ class GunNode {
         }
         
         if (!hasValidService) {
-            console.warn('No valid service found for infohash');
+            console.warn('validateSchema: No valid service found for infohash');
             return false;
         }
         
@@ -1071,7 +1026,7 @@ class GunNode {
                     retries--;
                     if (retries > 0) {
                         console.warn(`Decryption failed, retrying... (${retries} attempts left)`);
-                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        await new Promise(resolve => setTimeout(resolve, 100)); // Reduce retry delay to 100ms
                     }
                 }
             }
@@ -1095,28 +1050,12 @@ class GunNode {
 
     // Get data with SEA decryption
     async getData(key, callback) {
-        const startTime = Date.now();
-        
-        // Check the cache first
-        if (this.entryCache.has(key)) {
-            const cachedEntry = this.entryCache.get(key);
-            // Check if the cached entry is still valid
-            if (Date.now() < cachedEntry.expiry) {
-                // Validate the cached data
-                if (this.validateSchema(cachedEntry.data)) {
-                    callback(cachedEntry.data);
-                    return;
-                } else {
-                    // Remove invalid entry from cache
-                    this.entryCache.delete(key);
-                }
-            } else {
-                // Remove expired entry
-                this.entryCache.delete(key);
-            }
+        if (!this.gun) {
+            console.warn('Gun not initialized');
+            callback(null);
+            return;
         }
-        
-        // Proceed with normal retrieval if not in cache
+
         this.cacheTable.get(key).once(async (data) => {
             if (!data) {
                 callback(null);
@@ -1153,12 +1092,6 @@ class GunNode {
                     return;
                 }
                 
-                // Store in cache
-                this.entryCache.set(key, {
-                    data: cleanedData,
-                    expiry: Date.now() + this.entryCacheTTL
-                });
-                
                 callback(cleanedData);
             } catch (error) {
                 console.error(`Error processing data for key ${key}:`, error);
@@ -1169,70 +1102,74 @@ class GunNode {
 
     // Get all data with SEA decryption
     getAllData(callback) {
-        const allData = {};
-        let receivedCount = 0;
-        let lastReceived = Date.now();
-        let pendingDecryptions = 0;
-        
-        // Set a timeout to ensure we don't wait forever
-        const maxWaitTime = 3000; // 3 seconds max wait
-        const startTime = Date.now();
-        
-        // We'll consider data collection complete if no new data 
-        // has been received for 500ms, or we hit the max wait time,
-        // and all decryptions are complete
-        const checkComplete = () => {
-            const now = Date.now();
-            if (((now - lastReceived > 500 && receivedCount > 0) || (now - startTime > maxWaitTime)) && pendingDecryptions === 0) {
-                callback(allData);
-                return true;
-            }
-            return false;
-        };
-        
-        const intervalId = setInterval(() => {
-            if (checkComplete()) {
-                clearInterval(intervalId);
-            }
-        }, 500);
-        
+        if (!this.gun) {
+            console.warn('Gun not initialized');
+            callback({});
+            return;
+        }
+
+        const results = {};
+        let completed = false;
+        let totalProcessed = 0;
+        let totalDecrypted = 0;
+        let totalValid = 0;
+
+        console.log('Starting getAllData retrieval...');
+
+        // Use Gun's native map().once() to get all data
         this.cacheTable.map().once(async (data, hash) => {
-            if (data) {
-                try {
-                    pendingDecryptions++;
-                    // Decrypt the data if it's encrypted
-                    let decryptedData;
-                    if (data.encryptedData) {
-                        decryptedData = await this.decrypt(data);
-                        if (!decryptedData) {
-                            console.warn(`Failed to decrypt data for hash: ${hash}`);
-                            pendingDecryptions--;
-                            return;
-                        }
-                    } else {
-                        // Make a copy of the raw data for legacy support
-                        decryptedData = JSON.parse(JSON.stringify(data));
+            totalProcessed++;
+            console.log(`Processing hash: ${hash}, data present: ${!!data}`);
+            
+            if (!data) return;
+            
+            try {
+                // Decrypt the data if it's encrypted
+                let decryptedData;
+                if (data.encryptedData) {
+                    decryptedData = await this.decrypt(data);
+                    if (!decryptedData) {
+                        console.warn(`Failed to decrypt data for hash: ${hash}`);
+                        return;
                     }
-                    
-                    // Add the hash as infohash if not present
-                    if (!decryptedData.infohash) {
-                        decryptedData.infohash = hash;
-                    }
-                    
-                    allData[hash] = decryptedData;
-                    receivedCount++;
-                    lastReceived = Date.now();
-                } catch (error) {
-                    console.error(`Error processing data for hash ${hash}:`, error);
-                } finally {
-                    pendingDecryptions--;
-                    // Check if we're done after this decryption
-                    if (checkComplete()) {
-                        clearInterval(intervalId);
-                    }
+                    totalDecrypted++;
+                    console.log(`Successfully decrypted data for hash: ${hash}`);
+                } else {
+                    decryptedData = JSON.parse(JSON.stringify(data));
+                    console.log(`Non-encrypted data found for hash: ${hash}`);
                 }
+                
+                // Add the hash as infohash if not present
+                if (!decryptedData.infohash) {
+                    decryptedData.infohash = hash;
+                }
+                
+                // Clean and validate the data
+                const cleanedData = this.cleanData(decryptedData);
+                if (!cleanedData || !this.validateSchema(cleanedData)) {
+                    console.warn(`Invalid data format for hash: ${hash}, cleaned: ${!!cleanedData}, schema valid: ${!!cleanedData && this.validateSchema(cleanedData)}`);
+                    return;
+                }
+                
+                totalValid++;
+                console.log(`Valid data added for hash: ${hash}`);
+                results[hash] = cleanedData;
+            } catch (error) {
+                console.error(`Error processing data for hash ${hash}:`, error);
             }
+        }).then(() => {
+            completed = true;
+            console.log(`getAllData completed. Total processed: ${totalProcessed}, decrypted: ${totalDecrypted}, valid: ${totalValid}`);
+            callback(results);
         });
+
+        // Set a timeout to ensure we don't wait forever
+        setTimeout(() => {
+            if (!completed) {
+                console.warn(`getAllData timeout reached, returning partial results. Processed: ${totalProcessed}, decrypted: ${totalDecrypted}, valid: ${totalValid}`);
+                callback(results);
+            }
+        }, 15000); // Increased to 15 seconds
     }
 
     // Set data with SEA encryption
@@ -1284,15 +1221,6 @@ class GunNode {
         // Add or update the service data in the nested structure
         processedData.services[serviceName] = serviceData;
 
-        // Update the cache with the new data
-        if (this.entryCache.has(infohash)) {
-            this.entryCache.set(infohash, {
-                data: processedData,
-                expiry: Date.now() + this.entryCacheTTL
-            });
-            console.log(`Cache entry updated for infohash: ${infohash}`);
-        }
-
         // Encrypt the processed data
         const encryptedData = await this.encrypt(processedData);
         if (!encryptedData) {
@@ -1316,67 +1244,116 @@ class GunNode {
     async getFilteredData(options = {}) {
         const { limit = 50, minTimestamp, maxTimestamp, filter = {} } = options;
         
-        return new Promise((resolve) => {
-            this.getAllData((allData) => {
-                // Process all data entries
-                const processedEntries = Object.entries(allData)
-                    .map(([infohash, data]) => {
-                        // Skip if no services or invalid data
-                        if (!data || !data.services || typeof data.services !== 'object') {
-                            return null;
-                        }
+        return new Promise(async (resolve) => {
+            if (!this.gun) {
+                console.warn('Gun not initialized');
+                resolve({
+                    total: 0,
+                    returned: 0,
+                    limit,
+                    data: [],
+                    schema_version: "2.0"
+                });
+                return;
+            }
 
-                        // Process each service entry
-                        const validServices = {};
-                        let newestTimestamp = 0;
+            try {
+                // Get data directly from the graph
+                const graph = this.gun._.graph;
+                console.log(`Processing graph with ${Object.keys(graph).length} total entries`);
 
-                        Object.entries(data.services).forEach(([serviceName, serviceData]) => {
-                            // Validate service data
-                            if (serviceData.cached !== true && serviceData.cached !== false) return;
-                            if (!serviceData.last_modified || !isValidISODate(serviceData.last_modified)) return;
-                            if (!serviceData.expiry || !isValidISODate(serviceData.expiry)) return;
+                // Process all entries from the graph
+                const processedEntries = await Promise.all(
+                    Object.entries(graph)
+                        .filter(([key, value]) => {
+                            return key.startsWith('cache/') && 
+                                   key !== 'cache' && 
+                                   value !== null && 
+                                   typeof value === 'object';
+                        })
+                        .map(async ([key, value]) => {
+                            const infohash = key.replace('cache/', '');
+                            
+                            try {
+                                // Handle encrypted data
+                                if (value.encryptedData) {
+                                    const decrypted = await this.decrypt(value);
+                                    if (!decrypted) {
+                                        console.log(`Failed to decrypt data for ${infohash}`);
+                                        return null;
+                                    }
+                                    value = decrypted;
+                                }
 
-                            // Add valid service data
-                            validServices[serviceName] = serviceData;
+                                // Validate and clean the data
+                                if (!value || !value.services || typeof value.services !== 'object') {
+                                    console.log(`Invalid data structure for ${infohash}`);
+                                    return null;
+                                }
 
-                            // Track newest timestamp
-                            const timestamp = new Date(serviceData.last_modified).getTime();
-                            if (timestamp > newestTimestamp) {
-                                newestTimestamp = timestamp;
+                                // Process services
+                                const validServices = {};
+                                let newestTimestamp = 0;
+
+                                Object.entries(value.services).forEach(([serviceName, serviceData]) => {
+                                    if (serviceData.cached !== true && serviceData.cached !== false) {
+                                        console.log(`Invalid cached status for service ${serviceName} in ${infohash}`);
+                                        return;
+                                    }
+                                    if (!serviceData.last_modified || !isValidISODate(serviceData.last_modified)) {
+                                        console.log(`Invalid last_modified for service ${serviceName} in ${infohash}`);
+                                        return;
+                                    }
+                                    if (!serviceData.expiry || !isValidISODate(serviceData.expiry)) {
+                                        console.log(`Invalid expiry for service ${serviceName} in ${infohash}`);
+                                        return;
+                                    }
+
+                                    validServices[serviceName] = serviceData;
+
+                                    const timestamp = new Date(serviceData.last_modified).getTime();
+                                    if (timestamp > newestTimestamp) {
+                                        newestTimestamp = timestamp;
+                                    }
+                                });
+
+                                if (Object.keys(validServices).length === 0) {
+                                    console.log(`No valid services for ${infohash}`);
+                                    return null;
+                                }
+
+                                return {
+                                    infohash,
+                                    services: validServices,
+                                    newest_timestamp: newestTimestamp
+                                };
+                            } catch (error) {
+                                console.error(`Error processing entry ${infohash}:`, error);
+                                return null;
                             }
-                        });
+                        })
+                );
 
-                        // Skip if no valid services
-                        if (Object.keys(validServices).length === 0) {
-                            return null;
-                        }
+                // Filter out null entries and apply filters
+                let filteredEntries = processedEntries.filter(entry => entry !== null);
+                console.log(`Found ${filteredEntries.length} valid entries before filtering`);
 
-                        return {
-                            infohash,
-                            services: validServices,
-                            newest_timestamp: newestTimestamp
-                        };
-                    })
-                    .filter(entry => entry !== null); // Remove invalid entries
-
-                // Apply timestamp filters if provided
-                let filteredEntries = processedEntries;
+                // Apply timestamp filters
                 if (minTimestamp) {
-                    filteredEntries = filteredEntries.filter(entry => 
-                        entry.newest_timestamp >= new Date(minTimestamp).getTime()
-                    );
+                    const minTime = new Date(minTimestamp).getTime();
+                    filteredEntries = filteredEntries.filter(entry => entry.newest_timestamp >= minTime);
+                    console.log(`After minTimestamp filter: ${filteredEntries.length} entries`);
                 }
                 
                 if (maxTimestamp) {
-                    filteredEntries = filteredEntries.filter(entry => 
-                        entry.newest_timestamp <= new Date(maxTimestamp).getTime()
-                    );
+                    const maxTime = new Date(maxTimestamp).getTime();
+                    filteredEntries = filteredEntries.filter(entry => entry.newest_timestamp <= maxTime);
+                    console.log(`After maxTimestamp filter: ${filteredEntries.length} entries`);
                 }
                 
-                // Apply any additional filter properties
+                // Apply additional filters
                 if (Object.keys(filter).length > 0) {
                     filteredEntries = filteredEntries.filter(entry => {
-                        // For service-specific filters, check all services
                         return Object.values(entry.services).some(serviceData => {
                             return Object.entries(filter).every(([key, value]) => {
                                 if (key === 'cached' || key === 'last_modified' || key === 'expiry') {
@@ -1386,24 +1363,37 @@ class GunNode {
                             });
                         });
                     });
+                    console.log(`After additional filters: ${filteredEntries.length} entries`);
                 }
 
                 // Sort by newest timestamp and apply limit
                 filteredEntries.sort((a, b) => b.newest_timestamp - a.newest_timestamp);
-                filteredEntries = filteredEntries.slice(0, limit);
+                const limitedEntries = filteredEntries.slice(0, limit);
+                console.log(`After limiting to ${limit}: ${limitedEntries.length} entries`);
 
                 // Remove the temporary newest_timestamp field
-                filteredEntries.forEach(entry => {
+                limitedEntries.forEach(entry => {
                     delete entry.newest_timestamp;
                 });
 
                 resolve({
                     total: filteredEntries.length,
+                    returned: limitedEntries.length,
                     limit,
-                    data: filteredEntries,
+                    data: limitedEntries,
                     schema_version: "2.0"
                 });
-            });
+            } catch (error) {
+                console.error('Error in getFilteredData:', error);
+                resolve({
+                    total: 0,
+                    returned: 0,
+                    limit,
+                    data: [],
+                    schema_version: "2.0",
+                    error: error.message
+                });
+            }
         });
     }
 
@@ -1436,12 +1426,6 @@ class GunNode {
                 }
             }
 
-            // Remove from local cache if present
-            if (this.entryCache.has(infohash)) {
-                this.entryCache.delete(infohash);
-                console.log(`Cache entry invalidated for infohash: ${infohash}`);
-            }
-
             // Use Gun's null operation to remove the data
             return new Promise((resolve) => {
                 this.cacheTable.get(infohash).put(null, (ack) => {
@@ -1458,6 +1442,32 @@ class GunNode {
             console.error('Error in invalidateData:', error);
             return false;
         }
+    }
+
+    async getStartupCount() {
+        return new Promise((resolve) => {
+            let count = 0;
+            let seen = new Set();
+            let completed = false;
+
+            console.log('Starting initial database count...');
+
+            this.cacheTable.map().on((data, key) => {
+                if (!seen.has(key) && data !== null && data !== undefined) {
+                    count++;
+                    seen.add(key);
+                }
+            });
+
+            // Force resolution after 10 seconds to ensure we get a good initial count
+            setTimeout(() => {
+                if (!completed) {
+                    completed = true;
+                    console.log(`Initial count completed: ${count} entries found`);
+                    resolve(count);
+                }
+            }, 10000);
+        });
     }
 }
 
