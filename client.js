@@ -77,13 +77,9 @@ class GunNode {
             connectToRemote: !config.isRemoteServer && (config.connectToRemote || false),
             port: config.port || 8888,
             gatheringIntervalMinutes: config.gatheringIntervalMinutes || 15,
-            connectionTrimIntervalMinutes: config.connectionTrimIntervalMinutes || 5, // Add connection trimming interval config
-            maxActiveConnections: config.maxActiveConnections || 2000, // Maximum number of active connections
             peers: [] // Will be populated dynamically
         };
         this.pair = null; // Will store SEA key pair
-        this.activeConnections = new Map(); // Track active connections and their last activity time
-        this.trimConnectionInterval = null; // Will store the interval reference for connection trimming
     }
 
     setupExpress() {
@@ -573,9 +569,6 @@ class GunNode {
             // Set up periodic data gathering
             this.setupPeriodicDataGathering();
             
-            // Set up periodic connection trimming
-            this.setupConnectionTrimming();
-            
             console.log('Node initialized successfully');
             return true;
         } catch (error) {
@@ -650,11 +643,8 @@ class GunNode {
                 let newEntriesFound = 0;
                 const maxSampleTime = 60 * 1000; // 60 seconds max
                 
-                // Create a temporary subscription that will be cleaned up
-                let mapSubscription = null;
-                
                 // Sample from cache table
-                mapSubscription = this.cacheTable.map().on((data, key) => {
+                this.cacheTable.map().on((data, key) => {
                     if (data && key !== 'cache' && !alreadySeen.has(key)) {
                         alreadySeen.add(key);
                         newEntriesFound++;
@@ -666,12 +656,9 @@ class GunNode {
                     }
                 });
                 
-                // Set a timeout to end sampling and clean up the subscription
+                // Set a timeout to end sampling
                 setTimeout(() => {
-                    if (mapSubscription) {
-                        this.cacheTable.map().off();
-                        mapSubscription = null;
-                    }
+                    this.cacheTable.map().off();
                     resolve(newEntriesFound);
                 }, maxSampleTime);
             });
@@ -690,9 +677,6 @@ class GunNode {
             
             // Update the estimated count
             this.estimatedCount = afterCount;
-            
-            // After gathering data, run a connection trim to clean up
-            this.trimActiveConnections();
         } catch (error) {
             console.error('Error during data gathering cycle:', error);
         }
@@ -710,24 +694,11 @@ class GunNode {
             console.log('Stopped periodic data gathering');
         }
         
-        // Clear connection trimming interval if it exists
-        if (this.trimConnectionInterval) {
-            clearInterval(this.trimConnectionInterval);
-            this.trimConnectionInterval = null;
-            console.log('Stopped periodic connection trimming');
-        }
-        
         // Unsubscribe from updates if subscription exists
         if (this.updateSubscription) {
             this.updateSubscription.unsubscribe();
             this.updateSubscription = null;
             console.log('Unsubscribed from data updates');
-        }
-        
-        // Force call off() on cache table to release all connections
-        if (this.cacheTable) {
-            this.cacheTable.map().off();
-            console.log('Released all persistent connections to cache table');
         }
         
         console.log('Cleanup completed');
@@ -745,11 +716,9 @@ class GunNode {
         // Track when nodes were last processed to avoid duplicates
         const processedNodes = new Map();
         const throttleTime = 10000; // 10 seconds throttle
-        let activeListener = null;
         
-        // Use a more targeted approach to listen for updates
-        // Instead of listening to all keys with map(), listen to specific soul
-        const updateCallback = (data, key) => {
+        // Listen for updates to cache
+        this.cacheTable.on((data, key) => {
             // Skip null data or cache root
             if (!data || key === 'cache') return;
             
@@ -767,37 +736,13 @@ class GunNode {
             // Log updates very sparingly
             if (this.dataUpdateTracking.totalUpdates % 100 === 0) {
                 console.log(`Received ~${this.dataUpdateTracking.totalUpdates} updates`);
-                
-                // Periodically clean up the processedNodes map to prevent memory leaks
-                if (processedNodes.size > 10000) {
-                    console.log(`Cleaning up processed nodes tracking (${processedNodes.size} entries)`);
-                    // Keep only recent entries (last 5 minutes)
-                    const cutoffTime = now - (5 * 60 * 1000);
-                    for (const [nodeKey, timestamp] of processedNodes.entries()) {
-                        if (timestamp < cutoffTime) {
-                            processedNodes.delete(nodeKey);
-                        }
-                    }
-                    console.log(`After cleanup: ${processedNodes.size} entries remain`);
-                }
             }
-        };
+        });
         
-        // Set up the listener - instead of using map().on which creates many listeners,
-        // use a single targeted listener on the cache table
-        activeListener = this.cacheTable.on(updateCallback);
-        
-        // Return an object with an unsubscribe method to clean up properly
         return {
             unsubscribe: () => {
-                if (activeListener) {
-                    this.cacheTable.off(updateCallback);
-                    activeListener = null;
-                    console.log('Unsubscribed from data updates');
-                }
-                
-                // Clear the processed nodes to free memory
-                processedNodes.clear();
+                this.cacheTable.off();
+                console.log('Unsubscribed from data updates');
             }
         };
     }
@@ -821,7 +766,6 @@ class GunNode {
             let count = 0;
             let sampleSize = 0;
             const maxSamples = 1000;
-            let mapSubscription = null;
             
             // Set up a promise that will resolve after a timeout
             const timeoutPromise = new Promise(resolve => {
@@ -830,8 +774,7 @@ class GunNode {
             
             // Set up the sampling promise
             const samplingPromise = new Promise(resolve => {
-                // Use a throttled approach to reduce memory pressure
-                mapSubscription = this.cacheTable.map().on((data, key) => {
+                this.cacheTable.map().on((data, key) => {
                     if (data && key !== 'cache') {
                         count++;
                     }
@@ -846,21 +789,13 @@ class GunNode {
             
             // Race between timeout and sampling
             Promise.race([timeoutPromise, samplingPromise])
-                .then((result) => {
-                    // Clean up subscription, regardless of which promise resolved
-                    if (mapSubscription) {
-                        this.cacheTable.map().off();
-                        mapSubscription = null;
-                    }
+                .then(() => {
+                    this.cacheTable.map().off();
                     resolve(count);
                 })
                 .catch(err => {
                     console.error('Error during count estimation:', err);
-                    // Ensure cleanup happens even on error
-                    if (mapSubscription) {
-                        this.cacheTable.map().off();
-                        mapSubscription = null;
-                    }
+                    this.cacheTable.map().off();
                     resolve(0);
                 });
         });
@@ -1632,92 +1567,6 @@ class GunNode {
             return false;
         }
     }
-
-    // Set up periodic connection trimming to prevent too many active connections
-    setupConnectionTrimming() {
-        const trimIntervalMinutes = this.config.connectionTrimIntervalMinutes || 5;
-        const trimInterval = trimIntervalMinutes * 60 * 1000;
-        
-        console.log(`Setting up connection trimming every ${trimIntervalMinutes} minutes`);
-        
-        // Run connection trimming periodically
-        this.trimConnectionInterval = setInterval(() => {
-            this.trimActiveConnections();
-        }, trimInterval);
-        
-        // Run an initial trim after 30 seconds to handle any startup connections
-        setTimeout(() => {
-            this.trimActiveConnections();
-        }, 30000);
-    }
-    
-    // Trim active connections to prevent memory issues and "too many GETs" warnings
-    trimActiveConnections() {
-        if (!this.gun) {
-            console.warn('Cannot trim connections: Gun not initialized');
-            return;
-        }
-        
-        try {
-            console.log('Starting connection trimming cycle...');
-            
-            // Get the Gun internal graph
-            const graph = this.gun._.graph || {};
-            
-            // Get all active connections from Gun's internal state
-            let liveConnections = 0;
-            let trimmedConnections = 0;
-            
-            // Find all nodes with active GETs
-            if (this.gun.back && this.gun.back('opt.peers')) {
-                // Log peer connections
-                const peers = this.gun.back('opt.peers');
-                console.log(`Active peer connections: ${Object.keys(peers).length}`);
-            }
-            
-            // Check for active connections in the graph
-            try {
-                // Count active listeners by iterating through the graph state
-                Object.keys(graph).forEach(key => {
-                    const node = graph[key];
-                    if (node && node._ && node._['>']) {
-                        // Has listeners (GETs)
-                        liveConnections++;
-                    }
-                });
-                
-                console.log(`Found ${liveConnections} active GET connections`);
-                
-                // If we have too many connections, perform a targeted cleanup
-                const maxConnections = this.config.maxActiveConnections || 2000;
-                if (liveConnections > maxConnections) {
-                    console.log(`Too many active connections (${liveConnections}), trimming...`);
-                    
-                    // Perform cleanup by turning off cached listeners
-                    // First release any map listeners on the cache table
-                    this.cacheTable.map().off();
-                    
-                    // Reset our update subscription to maintain essential functionality
-                    if (this.updateSubscription) {
-                        this.updateSubscription.unsubscribe();
-                        this.updateSubscription = this.subscribeToLightUpdates();
-                    }
-                    
-                    // Log the cleanup action
-                    console.log(`Released map listeners to reduce connection count`);
-                    trimmedConnections = liveConnections;
-                } else {
-                    console.log(`Connection count (${liveConnections}) is under limit, no trimming needed`);
-                }
-            } catch (err) {
-                console.error('Error accessing Gun internal state:', err);
-            }
-            
-            console.log(`Connection trimming completed: ${trimmedConnections} connections released`);
-        } catch (error) {
-            console.error('Error during connection trimming:', error);
-        }
-    }
 }
 
 // Parse command line arguments
@@ -1726,8 +1575,6 @@ const nodeType = args[0] || 'local';  // Default to local if no argument
 const port = args[1] || 8888;  // Optional port argument
 const gatheringInterval = args[2] ? parseInt(args[2]) : 15;  // Optional gathering interval in minutes, default 15
 const initialDelay = args[3] ? parseInt(args[3]) : 5;  // Optional initial delay in minutes, default 5
-const connectionTrimInterval = args[4] ? parseInt(args[4]) : 5; // Optional connection trim interval in minutes, default 5
-const maxConnections = args[5] ? parseInt(args[5]) : 2000; // Optional max connections parameter, default 2000
 
 // Configure node based on type
 const config = {
@@ -1735,9 +1582,7 @@ const config = {
     connectToRemote: nodeType === 'local',
     port: parseInt(port),
     gatheringIntervalMinutes: gatheringInterval,
-    initialDelayMinutes: initialDelay,
-    connectionTrimIntervalMinutes: connectionTrimInterval,
-    maxActiveConnections: maxConnections
+    initialDelayMinutes: initialDelay
 };
 
 // Create and initialize node
@@ -1793,8 +1638,6 @@ console.log(`Mode: ${config.isRemoteServer ? 'Remote Server' : 'Local Client'}`)
 console.log(`Port: ${config.port}`);
 console.log(`Data Gathering Interval: ${config.gatheringIntervalMinutes} minutes`);
 console.log(`Initial Delay: ${config.initialDelayMinutes} minutes`);
-console.log(`Connection Trim Interval: ${config.connectionTrimIntervalMinutes} minutes`);
-console.log(`Max Active Connections: ${config.maxActiveConnections}`);
 console.log(`Peer Discovery: Enabled (using gun-relays)`);
 console.log('\nEncryption Configuration:');
 console.log('----------------------');
