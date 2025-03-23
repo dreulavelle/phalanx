@@ -1860,6 +1860,10 @@ const initializeRelays = async () => {
         
         // Get initial relay list
         const relays = await Relays();
+        
+        // Add our hardcoded relay server
+        relays.push('http://129.153.56.54:8888/gun');
+        
         node.config.peers = relays;
         
         // Initialize node after relay discovery
@@ -1868,6 +1872,10 @@ const initializeRelays = async () => {
     } catch (err) {
         console.error('Error initializing relays:', err);
         // Fallback to local node only if relay discovery fails
+        
+        // Still add our hardcoded relay even if relay discovery fails
+        node.config.peers = ['http://129.153.56.54:8888/gun'];
+        
         await node.initialize();
     }
 };
