@@ -529,6 +529,15 @@ class GunNode {
             });
 
             // Initialize Gun with optimized configuration
+            const fs = require('fs');
+            const path = require('path');
+            
+            // Ensure data directory exists
+            const dataDir = path.join(process.cwd(), 'data');
+            if (!fs.existsSync(dataDir)) {
+                fs.mkdirSync(dataDir, { recursive: true });
+            }
+
             this.gun = Gun({
                 web: server,
                 peers: this.config.peers,
@@ -541,8 +550,13 @@ class GunNode {
                 super: this.config.isRemoteServer,
                 sea: true,
                 axe: false,
-                cache: false, // Disable internal caching
-                memory: true, // Enable memory cleanup
+                cache: false,
+                memory: true,
+                chunk: 1024 * 1024 * 2,
+                wait: 500,
+                gap: 1000,
+                pack: 1024 * 1024 * 5,
+                max: 1024 * 1024 * 10
             });
 
             // Initialize the cache table
@@ -726,130 +740,135 @@ class GunNode {
             return null;
         }
         
-        console.log('Setting up lightweight data update listener');
+        console.log('Setting up lightweight data update listener (cleanup disabled)');
         
         // Track when nodes were last processed to avoid duplicates
         const processedNodes = new Map();
         const throttleTime = 10000; // 10 seconds throttle
         
-        // Keep track of active subscriptions with memory-aware limits
+        // Keep track of active subscriptions
         let activeSubscriptions = new Set();
-        const MAX_ACTIVE_SUBSCRIPTIONS = 2000; // Reduced limit
-        const CLEANUP_PERCENTAGE = 0.30; // Clean up 30% when limit is reached
-        const MEMORY_LIMIT_MB = 500; // Memory limit in MB
-        const CLEANUP_INTERVAL = 30000; // Run cleanup every 30 seconds
         
-        // Function to get current memory usage in MB
-        const getMemoryUsageMB = () => Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
-        
-        // Function to cleanup old subscriptions using percentage-based approach
-        const cleanupOldSubscriptions = (force = false) => {
-            const currentMemory = getMemoryUsageMB();
-            const memoryTrigger = currentMemory > MEMORY_LIMIT_MB;
-            const sizeTrigger = activeSubscriptions.size > MAX_ACTIVE_SUBSCRIPTIONS;
-            
-            if (force || memoryTrigger || sizeTrigger) {
-                console.log(`Cleaning up old subscriptions:
-                    - Current size: ${activeSubscriptions.size}
-                    - Memory usage: ${currentMemory}MB
-                    - Trigger: ${force ? 'Forced' : memoryTrigger ? 'Memory' : 'Size'}
-                `);
-                
-                const subscriptionsArray = Array.from(activeSubscriptions);
-                
-                // Calculate cleanup size - more aggressive if memory triggered
-                const cleanupPercentage = memoryTrigger ? 0.40 : CLEANUP_PERCENTAGE;
-                const removeCount = Math.floor(activeSubscriptions.size * cleanupPercentage);
-                const toRemove = subscriptionsArray.slice(0, removeCount);
-                
-                toRemove.forEach(key => {
-                    this.cacheTable.get(key).off();
-                    activeSubscriptions.delete(key);
-                    processedNodes.delete(key);
-                });
-                
-                console.log(`Cleaned up ${toRemove.length} subscriptions (${cleanupPercentage * 100}% of total)`);
-                console.log(`Remaining active subscriptions: ${activeSubscriptions.size}`);
-                
-                // Force garbage collection if available (Node.js only)
-                if (global.gc) {
-                    try {
-                        global.gc();
-                        console.log(`Forced garbage collection. New memory usage: ${getMemoryUsageMB()}MB`);
-                    } catch (e) {
-                        console.warn('Failed to force garbage collection:', e);
-                    }
-                }
-            }
-        };
-        
-        // Set up more frequent cleanup and health check
-        const cleanupInterval = setInterval(() => {
-            cleanupOldSubscriptions();
+        // Set up health check logging only (no cleanup)
+        const healthCheckInterval = setInterval(() => {
+            const currentMemory = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
             
             // Log subscription health metrics
-            console.log(`Subscription Health:
+            console.log(`Subscription Health (cleanup disabled):
                 - Active subscriptions: ${activeSubscriptions.size}
                 - Processed nodes: ${processedNodes.size}
-                - Memory usage: ${getMemoryUsageMB()}MB
+                - Memory usage: ${currentMemory}MB
                 - Last update: ${new Date(this.dataUpdateTracking.lastReceived).toISOString()}
+                - Total updates: ${this.dataUpdateTracking.totalUpdates}
+                - Error count: ${this.dataUpdateTracking.errorCount || 0}
             `);
-        }, CLEANUP_INTERVAL);
+        }, 60000); // Log every minute
         
         // Listen for updates to cache with proper subscription management
-        const subscription = this.cacheTable.map().on((data, key) => {
+        const subscription = this.cacheTable.map().on(async (data, key) => {
             // Skip null data, cache root, or Gun metadata
             if (!data || key === 'cache' || key === '_') return;
             
-            // Basic throttling with cleanup of old entries
+            // Basic throttling
             const now = Date.now();
             const lastTime = processedNodes.get(key) || 0;
             if (now - lastTime < throttleTime) return;
             
-            // Clean up very old entries from processedNodes (older than 30 minutes)
-            if (now - lastTime > 1800000) {
-                processedNodes.delete(key);
-                if (activeSubscriptions.has(key)) {
-                    this.cacheTable.get(key).off();
-                    activeSubscriptions.delete(key);
+            try {
+                // Decrypt and validate data before counting it
+                let decryptedData;
+                if (data.encryptedData) {
+                    decryptedData = await this.decrypt(data);
+                    if (!decryptedData) {
+                        console.warn(`Failed to decrypt data for key: ${key}`);
+                        return;
+                    }
+                } else {
+                    // Handle legacy data format
+                    try {
+                        decryptedData = JSON.parse(JSON.stringify(data));
+                        
+                        // If it's legacy format, try to convert it
+                        if (!decryptedData.services) {
+                            const serviceName = decryptedData.service || decryptedData.provider || 'default';
+                            
+                            // Only convert if we have valid cached status
+                            if (decryptedData.cached !== true && decryptedData.cached !== false) {
+                                console.warn(`Skipping legacy data conversion - invalid cached status for key: ${key}`);
+                                return;
+                            }
+                            
+                            // Ensure timestamps
+                            const last_modified = decryptedData.last_modified || new Date().toISOString();
+                            let expiry = decryptedData.expiry;
+                            if (!expiry) {
+                                const expiryDate = new Date(last_modified);
+                                if (decryptedData.cached) {
+                                    expiryDate.setDate(expiryDate.getDate() + 7);
+                                } else {
+                                    expiryDate.setHours(expiryDate.getHours() + 24);
+                                }
+                                expiry = expiryDate.toISOString();
+                            }
+                            
+                            // Convert to new format
+                            decryptedData = {
+                                infohash: decryptedData.infohash || key,
+                                services: {
+                                    [serviceName]: {
+                                        cached: decryptedData.cached,
+                                        last_modified,
+                                        expiry
+                                    }
+                                }
+                            };
+                        }
+                    } catch (parseError) {
+                        console.warn(`Failed to parse legacy data for key: ${key}`, parseError);
+                        return;
+                    }
                 }
-            }
-            
-            // Update tracking
-            processedNodes.set(key, now);
-            this.dataUpdateTracking.lastReceived = now;
-            this.dataUpdateTracking.totalUpdates++;
-            this.dataUpdateTracking.uniqueNodes.add(key);
-            
-            // Add to active subscriptions
-            activeSubscriptions.add(key);
-            
-            // Check memory and subscription limits
-            const currentMemory = getMemoryUsageMB();
-            if (currentMemory > MEMORY_LIMIT_MB || activeSubscriptions.size > MAX_ACTIVE_SUBSCRIPTIONS) {
-                cleanupOldSubscriptions();
-            }
-            
-            // Log updates very sparingly
-            if (this.dataUpdateTracking.totalUpdates % 100 === 0) {
-                console.log(`Received ~${this.dataUpdateTracking.totalUpdates} updates, active: ${activeSubscriptions.size}, memory: ${currentMemory}MB`);
+                
+                // Add the infohash if not present
+                if (!decryptedData.infohash) {
+                    decryptedData.infohash = key;
+                }
+                
+                // Clean and validate the data
+                const cleanedData = this.cleanData(decryptedData);
+                if (!cleanedData || !this.validateSchema(cleanedData)) {
+                    console.warn(`Invalid data format for key: ${key}`);
+                    return;
+                }
+                
+                // Track valid updates
+                processedNodes.set(key, now);
+                this.dataUpdateTracking.lastReceived = now;
+                this.dataUpdateTracking.totalUpdates++;
+                this.dataUpdateTracking.uniqueNodes.add(key);
+                
+                // Add to active subscriptions without cleanup
+                activeSubscriptions.add(key);
+                
+                // Log updates sparingly
+                if (this.dataUpdateTracking.totalUpdates % 100 === 0) {
+                    const currentMemory = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+                    console.log(`Received ~${this.dataUpdateTracking.totalUpdates} valid updates, active: ${activeSubscriptions.size}, memory: ${currentMemory}MB`);
+                }
+            } catch (error) {
+                console.error('Error processing update:', error);
+                this.dataUpdateTracking.errorCount = (this.dataUpdateTracking.errorCount || 0) + 1;
             }
         });
         
-        // Return an enhanced unsubscribe function that cleans up everything
+        // Return unsubscribe function
         return {
             unsubscribe: () => {
-                clearInterval(cleanupInterval);
+                clearInterval(healthCheckInterval);
                 subscription.off();
-                activeSubscriptions.forEach(key => {
-                    this.cacheTable.get(key).off();
-                });
                 activeSubscriptions.clear();
                 processedNodes.clear();
-                console.log('Unsubscribed from all data updates and cleaned up subscriptions');
-            },
-            forceCleanup: () => {
-                cleanupOldSubscriptions(true);
+                console.log('Unsubscribed from all data updates');
             }
         };
     }
@@ -1426,70 +1445,112 @@ class GunNode {
 
     // Set data with SEA encryption
     async setData(infohash, data) {
-        // First get existing data if any
-        const existingData = await new Promise((resolve) => {
-            this.getData(infohash, (result) => {
-                resolve(result);
+        try {
+            // First get existing data if any
+            const existingData = await new Promise((resolve) => {
+                this.getData(infohash, (result) => {
+                    resolve(result);
+                });
             });
-        });
 
-        // Extract the service name (default to 'default' if not specified)
-        const serviceName = data.provider || data.service || 'default';
-        
-        // Create or update the data object with nested services structure
-        const processedData = {
-            infohash: infohash,
-            services: existingData ? {...existingData.services} : {}
-        };
-        
-        // Create the service data object
-        const serviceData = {
-            cached: data.cached === true || data.cached === false ? data.cached : false,
-            last_modified: data.last_modified || new Date().toISOString()
-        };
-        
-        // Handle timestamp formatting
-        if (!serviceData.last_modified.endsWith('Z')) {
-            serviceData.last_modified = new Date(serviceData.last_modified).toISOString();
-        }
-        
-        // Directly use expiry if provided, otherwise calculate based on cached
-        if (data.expiry) {
-            serviceData.expiry = data.expiry.endsWith('Z') 
-                ? data.expiry 
-                : new Date(data.expiry).toISOString();
-        } else if (serviceData.cached === true) {
-            // Only calculate if not provided
-            const expiryDate = new Date(serviceData.last_modified);
-            expiryDate.setDate(expiryDate.getDate() + 7); // 7 days for cached=true
-            serviceData.expiry = expiryDate.toISOString();
-        } else {
-            // Only calculate if not provided
-            const expiryDate = new Date(serviceData.last_modified);
-            expiryDate.setHours(expiryDate.getHours() + 24); // 24 hours for cached=false
-            serviceData.expiry = expiryDate.toISOString();
-        }
+            // Extract the service name (default to 'default' if not specified)
+            const serviceName = data.provider || data.service || 'default';
+            
+            // Create or update the data object with nested services structure
+            const processedData = {
+                infohash: infohash,
+                services: existingData ? {...existingData.services} : {}
+            };
+            
+            // Create the service data object
+            const serviceData = {
+                cached: data.cached === true || data.cached === false ? data.cached : false,
+                last_modified: data.last_modified || new Date().toISOString()
+            };
+            
+            // Handle timestamp formatting
+            if (!serviceData.last_modified.endsWith('Z')) {
+                serviceData.last_modified = new Date(serviceData.last_modified).toISOString();
+            }
+            
+            // Directly use expiry if provided, otherwise calculate based on cached
+            if (data.expiry) {
+                serviceData.expiry = data.expiry.endsWith('Z') 
+                    ? data.expiry 
+                    : new Date(data.expiry).toISOString();
+            } else if (serviceData.cached === true) {
+                const expiryDate = new Date(serviceData.last_modified);
+                expiryDate.setDate(expiryDate.getDate() + 7); // 7 days for cached=true
+                serviceData.expiry = expiryDate.toISOString();
+            } else {
+                const expiryDate = new Date(serviceData.last_modified);
+                expiryDate.setHours(expiryDate.getHours() + 24); // 24 hours for cached=false
+                serviceData.expiry = expiryDate.toISOString();
+            }
 
-        // Add or update the service data in the nested structure
-        processedData.services[serviceName] = serviceData;
+            // Add or update the service data in the nested structure
+            processedData.services[serviceName] = serviceData;
 
-        // Encrypt the processed data
-        const encryptedData = await this.encrypt(processedData);
-        if (!encryptedData) {
-            console.error('Failed to encrypt data');
+            // Encrypt the processed data
+            const encryptedData = await this.encrypt(processedData);
+            if (!encryptedData) {
+                console.error('Failed to encrypt data');
+                return false;
+            }
+
+            return new Promise((resolve) => {
+                let retries = 3;
+                const attemptPut = () => {
+                    if (retries <= 0) {
+                        console.error('Failed to store data after all retries');
+                        resolve(false);
+                        return;
+                    }
+
+                    const timeout = setTimeout(() => {
+                        retries--;
+                        console.warn(`Write operation timed out, retries left: ${retries}`);
+                        if (retries > 0) {
+                            attemptPut();
+                        } else {
+                            resolve(false);
+                        }
+                    }, 10000);
+
+                    try {
+                        this.cacheTable.get(infohash).put(encryptedData, (ack) => {
+                            clearTimeout(timeout);
+                            if (ack.err) {
+                                if (ack.err === 'Chunk too big!' && retries > 0) {
+                                    retries--;
+                                    console.warn(`Chunk too big, retrying with delay... (${retries} retries left)`);
+                                    setTimeout(attemptPut, 1000);
+                                } else {
+                                    console.error('Error storing data:', ack.err);
+                                    resolve(false);
+                                }
+                            } else {
+                                resolve(true);
+                            }
+                        });
+                    } catch (error) {
+                        clearTimeout(timeout);
+                        console.error('Error in put operation:', error);
+                        retries--;
+                        if (retries > 0) {
+                            setTimeout(attemptPut, 1000);
+                        } else {
+                            resolve(false);
+                        }
+                    }
+                };
+
+                attemptPut();
+            });
+        } catch (error) {
+            console.error('Error in setData:', error);
             return false;
         }
-
-        return new Promise((resolve) => {
-            this.cacheTable.get(infohash).put(encryptedData, (ack) => {
-                if (ack.err) {
-                    console.error('Error storing data:', ack.err);
-                    resolve(false);
-                } else {
-                    resolve(true);
-                }
-            });
-        });
     }
 
     // Get filtered data (simplified)
@@ -1799,10 +1860,6 @@ const initializeRelays = async () => {
         
         // Get initial relay list
         const relays = await Relays();
-        
-        // Add our hardcoded relay server
-        relays.push('http://129.153.56.54:8888/gun');
-        
         node.config.peers = relays;
         
         // Initialize node after relay discovery
@@ -1811,10 +1868,6 @@ const initializeRelays = async () => {
     } catch (err) {
         console.error('Error initializing relays:', err);
         // Fallback to local node only if relay discovery fails
-        
-        // Still add our hardcoded relay even if relay discovery fails
-        node.config.peers = ['http://129.153.56.54:8888/gun'];
-        
         await node.initialize();
     }
 };
