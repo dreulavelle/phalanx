@@ -528,7 +528,7 @@ class GunNode {
                 console.log(`Node running on port ${port}`);
             });
 
-            // Initialize Gun with streamlined configuration
+            // Initialize Gun with optimized configuration
             this.gun = Gun({
                 web: server,
                 peers: this.config.peers,
@@ -540,7 +540,9 @@ class GunNode {
                 pid: NODE_ID,
                 super: this.config.isRemoteServer,
                 sea: true,
-                axe: false
+                axe: false,
+                cache: false, // Disable internal caching
+                memory: true, // Enable memory cleanup
             });
 
             // Initialize the cache table
@@ -556,6 +558,14 @@ class GunNode {
             
             // Set up a lightweight subscription for updates
             this.updateSubscription = this.subscribeToLightUpdates();
+            
+            // Set up periodic graph cleanup (every 5 minutes)
+            setInterval(() => {
+                this.cleanupGraph();
+            }, 5 * 60 * 1000);
+
+            // Do initial graph cleanup
+            await this.cleanupGraph();
             
             // Get an approximate count asynchronously without blocking startup
             this.estimateCount().then(count => {
@@ -580,7 +590,7 @@ class GunNode {
     // Set up periodic data gathering to continue discovering entries
     setupPeriodicDataGathering() {
         // Initial delay before starting periodic gathering (configurable, default 5 minutes)
-        const initialDelayMinutes = this.config.initialDelayMinutes || 5;
+        const initialDelayMinutes = this.config.initialDelayMinutes || 1;
         const initialDelay = initialDelayMinutes * 60 * 1000;
         
         // Interval between gathering attempts (from config, default 15 minutes)
@@ -700,6 +710,11 @@ class GunNode {
             this.updateSubscription = null;
             console.log('Unsubscribed from data updates');
         }
+
+        // Clean up the graph before exit
+        this.cleanupGraph().then(() => {
+            console.log('Graph cleanup completed');
+        });
         
         console.log('Cleanup completed');
     }
@@ -717,15 +732,88 @@ class GunNode {
         const processedNodes = new Map();
         const throttleTime = 10000; // 10 seconds throttle
         
-        // Listen for updates to cache
-        this.cacheTable.on((data, key) => {
-            // Skip null data or cache root
-            if (!data || key === 'cache') return;
+        // Keep track of active subscriptions with memory-aware limits
+        let activeSubscriptions = new Set();
+        const MAX_ACTIVE_SUBSCRIPTIONS = 2000; // Reduced limit
+        const CLEANUP_PERCENTAGE = 0.30; // Clean up 30% when limit is reached
+        const MEMORY_LIMIT_MB = 500; // Memory limit in MB
+        const CLEANUP_INTERVAL = 30000; // Run cleanup every 30 seconds
+        
+        // Function to get current memory usage in MB
+        const getMemoryUsageMB = () => Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+        
+        // Function to cleanup old subscriptions using percentage-based approach
+        const cleanupOldSubscriptions = (force = false) => {
+            const currentMemory = getMemoryUsageMB();
+            const memoryTrigger = currentMemory > MEMORY_LIMIT_MB;
+            const sizeTrigger = activeSubscriptions.size > MAX_ACTIVE_SUBSCRIPTIONS;
             
-            // Basic throttling
+            if (force || memoryTrigger || sizeTrigger) {
+                console.log(`Cleaning up old subscriptions:
+                    - Current size: ${activeSubscriptions.size}
+                    - Memory usage: ${currentMemory}MB
+                    - Trigger: ${force ? 'Forced' : memoryTrigger ? 'Memory' : 'Size'}
+                `);
+                
+                const subscriptionsArray = Array.from(activeSubscriptions);
+                
+                // Calculate cleanup size - more aggressive if memory triggered
+                const cleanupPercentage = memoryTrigger ? 0.40 : CLEANUP_PERCENTAGE;
+                const removeCount = Math.floor(activeSubscriptions.size * cleanupPercentage);
+                const toRemove = subscriptionsArray.slice(0, removeCount);
+                
+                toRemove.forEach(key => {
+                    this.cacheTable.get(key).off();
+                    activeSubscriptions.delete(key);
+                    processedNodes.delete(key);
+                });
+                
+                console.log(`Cleaned up ${toRemove.length} subscriptions (${cleanupPercentage * 100}% of total)`);
+                console.log(`Remaining active subscriptions: ${activeSubscriptions.size}`);
+                
+                // Force garbage collection if available (Node.js only)
+                if (global.gc) {
+                    try {
+                        global.gc();
+                        console.log(`Forced garbage collection. New memory usage: ${getMemoryUsageMB()}MB`);
+                    } catch (e) {
+                        console.warn('Failed to force garbage collection:', e);
+                    }
+                }
+            }
+        };
+        
+        // Set up more frequent cleanup and health check
+        const cleanupInterval = setInterval(() => {
+            cleanupOldSubscriptions();
+            
+            // Log subscription health metrics
+            console.log(`Subscription Health:
+                - Active subscriptions: ${activeSubscriptions.size}
+                - Processed nodes: ${processedNodes.size}
+                - Memory usage: ${getMemoryUsageMB()}MB
+                - Last update: ${new Date(this.dataUpdateTracking.lastReceived).toISOString()}
+            `);
+        }, CLEANUP_INTERVAL);
+        
+        // Listen for updates to cache with proper subscription management
+        const subscription = this.cacheTable.map().on((data, key) => {
+            // Skip null data, cache root, or Gun metadata
+            if (!data || key === 'cache' || key === '_') return;
+            
+            // Basic throttling with cleanup of old entries
             const now = Date.now();
             const lastTime = processedNodes.get(key) || 0;
             if (now - lastTime < throttleTime) return;
+            
+            // Clean up very old entries from processedNodes (older than 30 minutes)
+            if (now - lastTime > 1800000) {
+                processedNodes.delete(key);
+                if (activeSubscriptions.has(key)) {
+                    this.cacheTable.get(key).off();
+                    activeSubscriptions.delete(key);
+                }
+            }
             
             // Update tracking
             processedNodes.set(key, now);
@@ -733,16 +821,35 @@ class GunNode {
             this.dataUpdateTracking.totalUpdates++;
             this.dataUpdateTracking.uniqueNodes.add(key);
             
+            // Add to active subscriptions
+            activeSubscriptions.add(key);
+            
+            // Check memory and subscription limits
+            const currentMemory = getMemoryUsageMB();
+            if (currentMemory > MEMORY_LIMIT_MB || activeSubscriptions.size > MAX_ACTIVE_SUBSCRIPTIONS) {
+                cleanupOldSubscriptions();
+            }
+            
             // Log updates very sparingly
             if (this.dataUpdateTracking.totalUpdates % 100 === 0) {
-                console.log(`Received ~${this.dataUpdateTracking.totalUpdates} updates`);
+                console.log(`Received ~${this.dataUpdateTracking.totalUpdates} updates, active: ${activeSubscriptions.size}, memory: ${currentMemory}MB`);
             }
         });
         
+        // Return an enhanced unsubscribe function that cleans up everything
         return {
             unsubscribe: () => {
-                this.cacheTable.off();
-                console.log('Unsubscribed from data updates');
+                clearInterval(cleanupInterval);
+                subscription.off();
+                activeSubscriptions.forEach(key => {
+                    this.cacheTable.get(key).off();
+                });
+                activeSubscriptions.clear();
+                processedNodes.clear();
+                console.log('Unsubscribed from all data updates and cleaned up subscriptions');
+            },
+            forceCleanup: () => {
+                cleanupOldSubscriptions(true);
             }
         };
     }
@@ -1180,48 +1287,67 @@ class GunNode {
             return;
         }
 
-        this.cacheTable.get(key).once(async (data) => {
-            if (!data) {
-                callback(null);
-                return;
-            }
-
-            try {
-                // Decrypt the data if it's encrypted
-                let decryptedData;
-                if (data.encryptedData) {
-                    decryptedData = await this.decrypt(data);
-                    if (!decryptedData) {
-                        console.warn(`Failed to decrypt data for key: ${key}`);
-                        callback(null);
+        // Create a promise that will resolve with the data or timeout
+        const dataPromise = new Promise((resolve) => {
+            const subscription = this.cacheTable.get(key).once(async (data) => {
+                try {
+                    if (!data) {
+                        resolve(null);
                         return;
                     }
-                } else {
-                    // Make a copy of the raw data for legacy support
-                    decryptedData = JSON.parse(JSON.stringify(data));
+
+                    // Decrypt the data if it's encrypted
+                    let decryptedData;
+                    if (data.encryptedData) {
+                        decryptedData = await this.decrypt(data);
+                        if (!decryptedData) {
+                            console.warn(`Failed to decrypt data for key: ${key}`);
+                            resolve(null);
+                            return;
+                        }
+                    } else {
+                        // Make a copy of the raw data for legacy support
+                        decryptedData = JSON.parse(JSON.stringify(data));
+                    }
+                    
+                    // Add the infohash if not present
+                    if (!decryptedData.infohash) {
+                        decryptedData.infohash = key;
+                    }
+                    
+                    // Clean the data before returning
+                    const cleanedData = this.cleanData(decryptedData);
+                    
+                    // Only proceed if we have valid data
+                    if (!cleanedData || !this.validateSchema(cleanedData)) {
+                        console.warn(`Invalid data format for key: ${key}`);
+                        resolve(null);
+                        return;
+                    }
+                    
+                    resolve(cleanedData);
+                } catch (error) {
+                    console.error(`Error processing data for key ${key}:`, error);
+                    resolve(null);
                 }
-                
-                // Add the infohash if not present
-                if (!decryptedData.infohash) {
-                    decryptedData.infohash = key;
-                }
-                
-                // Clean the data before returning
-                const cleanedData = this.cleanData(decryptedData);
-                
-                // Only proceed if we have valid data
-                if (!cleanedData || !this.validateSchema(cleanedData)) {
-                    console.warn(`Invalid data format for key: ${key}`);
-                    callback(null);
-                    return;
-                }
-                
-                callback(cleanedData);
-            } catch (error) {
-                console.error(`Error processing data for key ${key}:`, error);
-                callback(null);
-            }
+            });
+
+            // Ensure subscription is cleaned up after use
+            setTimeout(() => {
+                subscription.off();
+            }, 100);
         });
+
+        // Set a timeout for the entire operation
+        const timeoutPromise = new Promise((resolve) => {
+            setTimeout(() => {
+                resolve(null);
+            }, 5000); // 5 second timeout
+        });
+
+        // Race between data retrieval and timeout
+        const result = await Promise.race([dataPromise, timeoutPromise]);
+        callback(result);
     }
 
     // Get all data with SEA decryption
@@ -1242,6 +1368,8 @@ class GunNode {
 
         // Use Gun's native map().once() to get all data
         this.cacheTable.map().once(async (data, hash) => {
+            if (hash === '_') return; // Skip internal Gun.js metadata
+            
             totalProcessed++;
             console.log(`Processing hash: ${hash}, data present: ${!!data}`);
             
@@ -1293,7 +1421,7 @@ class GunNode {
                 console.warn(`getAllData timeout reached, returning partial results. Processed: ${totalProcessed}, decrypted: ${totalDecrypted}, valid: ${totalValid}`);
                 callback(results);
             }
-        }, 15000); // Increased to 15 seconds
+        }, 15000); // 15 seconds timeout
     }
 
     // Set data with SEA encryption
@@ -1382,80 +1510,66 @@ class GunNode {
             }
 
             try {
-                // Get data directly from the graph
+                // Get data directly from the graph for better performance
                 const graph = this.gun._.graph;
-                console.log(`Processing graph with ${Object.keys(graph).length} total entries`);
+                const cacheEntries = Object.entries(graph).filter(([key]) => 
+                    key.startsWith('cache/') && key !== 'cache'
+                );
+                
+                console.log(`Processing ${cacheEntries.length} cache entries`);
 
                 // Process all entries from the graph
                 const processedEntries = await Promise.all(
-                    Object.entries(graph)
-                        .filter(([key, value]) => {
-                            return key.startsWith('cache/') && 
-                                   key !== 'cache' && 
-                                   value !== null && 
-                                   typeof value === 'object';
-                        })
-                        .map(async ([key, value]) => {
-                            const infohash = key.replace('cache/', '');
-                            
-                            try {
-                                // Handle encrypted data
-                                if (value.encryptedData) {
-                                    const decrypted = await this.decrypt(value);
-                                    if (!decrypted) {
-                                        console.log(`Failed to decrypt data for ${infohash}`);
-                                        return null;
-                                    }
-                                    value = decrypted;
-                                }
-
-                                // Validate and clean the data
-                                if (!value || !value.services || typeof value.services !== 'object') {
-                                    console.log(`Invalid data structure for ${infohash}`);
+                    cacheEntries.map(async ([key, value]) => {
+                        if (!value || typeof value !== 'object') return null;
+                        
+                        const infohash = key.replace('cache/', '');
+                        try {
+                            // Handle encrypted data
+                            if (value.encryptedData) {
+                                const decrypted = await this.decrypt(value);
+                                if (!decrypted) {
+                                    console.log(`Failed to decrypt data for ${infohash}`);
                                     return null;
                                 }
+                                value = decrypted;
+                            }
 
-                                // Process services
-                                const validServices = {};
-                                let newestTimestamp = 0;
-
-                                Object.entries(value.services).forEach(([serviceName, serviceData]) => {
-                                    if (serviceData.cached !== true && serviceData.cached !== false) {
-                                        console.log(`Invalid cached status for service ${serviceName} in ${infohash}`);
-                                        return;
-                                    }
-                                    if (!serviceData.last_modified || !isValidISODate(serviceData.last_modified)) {
-                                        console.log(`Invalid last_modified for service ${serviceName} in ${infohash}`);
-                                        return;
-                                    }
-                                    if (!serviceData.expiry || !isValidISODate(serviceData.expiry)) {
-                                        console.log(`Invalid expiry for service ${serviceName} in ${infohash}`);
-                                        return;
-                                    }
-
-                                    validServices[serviceName] = serviceData;
-
-                                    const timestamp = new Date(serviceData.last_modified).getTime();
-                                    if (timestamp > newestTimestamp) {
-                                        newestTimestamp = timestamp;
-                                    }
-                                });
-
-                                if (Object.keys(validServices).length === 0) {
-                                    console.log(`No valid services for ${infohash}`);
-                                    return null;
-                                }
-
-                                return {
-                                    infohash,
-                                    services: validServices,
-                                    newest_timestamp: newestTimestamp
-                                };
-                            } catch (error) {
-                                console.error(`Error processing entry ${infohash}:`, error);
+                            // Validate and clean the data
+                            if (!value || !value.services || typeof value.services !== 'object') {
+                                console.log(`Invalid data structure for ${infohash}`);
                                 return null;
                             }
-                        })
+
+                            // Process services
+                            const validServices = {};
+                            let newestTimestamp = 0;
+
+                            Object.entries(value.services).forEach(([serviceName, serviceData]) => {
+                                if (!this.validateServiceData(serviceData)) return;
+
+                                validServices[serviceName] = serviceData;
+                                const timestamp = new Date(serviceData.last_modified).getTime();
+                                if (timestamp > newestTimestamp) {
+                                    newestTimestamp = timestamp;
+                                }
+                            });
+
+                            if (Object.keys(validServices).length === 0) {
+                                console.log(`No valid services for ${infohash}`);
+                                return null;
+                            }
+
+                            return {
+                                infohash,
+                                services: validServices,
+                                newest_timestamp: newestTimestamp
+                            };
+                        } catch (error) {
+                            console.error(`Error processing entry ${infohash}:`, error);
+                            return null;
+                        }
+                    })
                 );
 
                 // Filter out null entries and apply filters
@@ -1466,13 +1580,11 @@ class GunNode {
                 if (minTimestamp) {
                     const minTime = new Date(minTimestamp).getTime();
                     filteredEntries = filteredEntries.filter(entry => entry.newest_timestamp >= minTime);
-                    console.log(`After minTimestamp filter: ${filteredEntries.length} entries`);
                 }
                 
                 if (maxTimestamp) {
                     const maxTime = new Date(maxTimestamp).getTime();
                     filteredEntries = filteredEntries.filter(entry => entry.newest_timestamp <= maxTime);
-                    console.log(`After maxTimestamp filter: ${filteredEntries.length} entries`);
                 }
                 
                 // Apply additional filters
@@ -1487,13 +1599,11 @@ class GunNode {
                             });
                         });
                     });
-                    console.log(`After additional filters: ${filteredEntries.length} entries`);
                 }
 
                 // Sort by newest timestamp and apply limit
                 filteredEntries.sort((a, b) => b.newest_timestamp - a.newest_timestamp);
                 const limitedEntries = filteredEntries.slice(0, limit);
-                console.log(`After limiting to ${limit}: ${limitedEntries.length} entries`);
 
                 // Remove the temporary newest_timestamp field
                 limitedEntries.forEach(entry => {
@@ -1519,6 +1629,20 @@ class GunNode {
                 });
             }
         });
+    }
+
+    // Helper method to validate service data
+    validateServiceData(serviceData) {
+        if (serviceData.cached !== true && serviceData.cached !== false) {
+            return false;
+        }
+        if (!serviceData.last_modified || !isValidISODate(serviceData.last_modified)) {
+            return false;
+        }
+        if (!serviceData.expiry || !isValidISODate(serviceData.expiry)) {
+            return false;
+        }
+        return true;
     }
 
     // Invalidate specific infohash data
@@ -1566,6 +1690,85 @@ class GunNode {
             console.error('Error in invalidateData:', error);
             return false;
         }
+    }
+
+    // Add graph cleanup method
+    async cleanupGraph() {
+        if (!this.gun) return;
+
+        console.log('Starting graph cleanup...');
+        const before = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+        const graph = this.gun._.graph;
+        let cleaned = 0;
+        let retained = 0;
+
+        // Get all cache entries
+        const entries = Object.entries(graph).filter(([key]) => key.startsWith('cache/'));
+        console.log(`Found ${entries.length} total entries in graph`);
+
+        for (const [key, value] of entries) {
+            try {
+                if (!value || value === null) {
+                    delete graph[key];
+                    cleaned++;
+                    continue;
+                }
+
+                // If it's encrypted data, try to decrypt to validate
+                if (value.encryptedData) {
+                    const decrypted = await this.decrypt(value);
+                    if (!decrypted) {
+                        delete graph[key];
+                        cleaned++;
+                        continue;
+                    }
+                }
+
+                // Check if the data is expired
+                if (value.services) {
+                    const now = new Date();
+                    const allExpired = Object.values(value.services).every(service => 
+                        service.expiry && new Date(service.expiry) < now
+                    );
+                    if (allExpired) {
+                        delete graph[key];
+                        cleaned++;
+                        continue;
+                    }
+                }
+
+                retained++;
+            } catch (error) {
+                console.warn(`Error processing graph entry ${key}:`, error);
+                delete graph[key];
+                cleaned++;
+            }
+        }
+
+        // Clean up Gun's internal caches if possible
+        if (this.gun._.opt && this.gun._.opt.cache) {
+            this.gun._.opt.cache = {};
+        }
+
+        // Force garbage collection if available
+        if (global.gc) {
+            try {
+                global.gc();
+            } catch (e) {
+                console.warn('Failed to force garbage collection:', e);
+            }
+        }
+
+        const after = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+        console.log(`Graph cleanup completed:
+            - Cleaned entries: ${cleaned}
+            - Retained entries: ${retained}
+            - Memory before: ${before}MB
+            - Memory after: ${after}MB
+            - Memory reduced: ${Math.max(0, before - after)}MB
+        `);
+
+        return { cleaned, retained, memoryReduced: Math.max(0, before - after) };
     }
 }
 
