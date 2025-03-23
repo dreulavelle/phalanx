@@ -76,9 +76,14 @@ class GunNode {
             isRemoteServer: config.isRemoteServer || false,
             connectToRemote: !config.isRemoteServer && (config.connectToRemote || false),
             port: config.port || 8888,
+            gatheringIntervalMinutes: config.gatheringIntervalMinutes || 15,
+            connectionTrimIntervalMinutes: config.connectionTrimIntervalMinutes || 5, // Add connection trimming interval config
+            maxActiveConnections: config.maxActiveConnections || 2000, // Maximum number of active connections
             peers: [] // Will be populated dynamically
         };
         this.pair = null; // Will store SEA key pair
+        this.activeConnections = new Map(); // Track active connections and their last activity time
+        this.trimConnectionInterval = null; // Will store the interval reference for connection trimming
     }
 
     setupExpress() {
@@ -270,42 +275,11 @@ class GunNode {
                 }
             });
 
-            // Get data count using the graph-based method (Method 2)
-            const graph = this.gun._.graph;
-            const dataCount = Object.entries(graph).filter(([key, value]) => {
-                return key.startsWith('cache/') && 
-                       key !== 'cache' && 
-                       value !== null && 
-                       typeof value === 'object';
-            }).length;
+            // Simple graph size check
+            const graph = this.gun._.graph || {};
+            const graphSize = Object.keys(graph).length;
+            const validCount = Object.keys(graph).length;
 
-            // For valid count, check entries that have either encryptedData or valid services
-            const validCount = Object.entries(graph)
-                .filter(([key, value]) => {
-                    if (!key.startsWith('cache/') || key === 'cache' || !value || typeof value !== 'object') {
-                        return false;
-                    }
-                    // Check if it's an encrypted entry
-                    if (value.encryptedData) {
-                        return true;
-                    }
-                    // Check if it has valid services
-                    if (value.services && typeof value.services === 'object') {
-                        return Object.values(value.services).some(service => {
-                            return (
-                                service &&
-                                typeof service === 'object' &&
-                                (service.cached === true || service.cached === false) &&
-                                service.last_modified &&
-                                isValidISODate(service.last_modified) &&
-                                service.expiry &&
-                                isValidISODate(service.expiry)
-                            );
-                        });
-                    }
-                    return false;
-                }).length;
-            
             res.json({
                 node: {
                     id: NODE_ID,
@@ -313,21 +287,28 @@ class GunNode {
                     port: this.config.port
                 },
                 peers: {
-                    relay_servers: relayServers,
-                    webrtc_peers: {
-                        connected: webrtcPeers.length,
-                        peers: webrtcPeers
-                    }
+                    relay_servers: relayServers
                 },
                 storage: {
                     enabled: this.gun._.opt.file ? true : false,
                     file: this.gun._.opt.file || null
                 },
                 data: {
-                    startup_count: this.startupCount,
-                    total: dataCount,
                     valid: validCount,
-                    graph_size: Object.keys(graph).length  // Added for verification
+                    estimated_count: this.estimatedCount || 0
+                },
+                updates: this.dataUpdateTracking ? {
+                    total_updates: this.dataUpdateTracking.totalUpdates,
+                    unique_nodes: this.dataUpdateTracking.uniqueNodes.size,
+                    last_update: new Date(this.dataUpdateTracking.lastReceived).toISOString(),
+                    age_ms: Date.now() - this.dataUpdateTracking.lastReceived
+                } : null,
+                data_gathering: {
+                    active: this.dataGatheringActive || !!this.dataGatheringInterval,
+                    next_run_in_ms: this.nextGatheringTime ? this.nextGatheringTime - Date.now() : null,
+                    last_run: this.lastGatheringTime ? new Date(this.lastGatheringTime).toISOString() : null,
+                    total_entries_found: this.totalGatheringEntries || 0,
+                    interval_minutes: this.config.gatheringIntervalMinutes || 15
                 },
                 encryption: {
                     enabled: !!ENCRYPTION_KEY,
@@ -505,119 +486,36 @@ class GunNode {
                 return res.status(503).json({ error: 'Database not initialized' });
             }
 
-            const counts = {
-                method1: 0,  // Direct map count
-                method2: 0,  // Path-based count
-                method3: 0,  // Node traversal count
-                timing: {}
-            };
-
             try {
-                // Method 1: Direct map count
-                const startMethod1 = Date.now();
-                await new Promise((resolve) => {
-                    let seen = new Set();
-                    this.cacheTable.map().on((data, key) => {
-                        if (!seen.has(key) && data !== null && data !== undefined) {
-                            counts.method1++;
-                            seen.add(key);
-                        }
-                    });
-                    
-                    // Force resolution after 3 seconds
-                    setTimeout(resolve, 3000);
-                });
-                counts.timing.method1 = Date.now() - startMethod1;
-
-                // Method 2: Path-based count using Gun's back() chain
-                const startMethod2 = Date.now();
-                const graph = this.gun._.graph;
-                const cacheEntries = Object.entries(graph).filter(([key, value]) => {
-                    return key.startsWith('cache/') && 
-                           key !== 'cache' && 
-                           value !== null && 
-                           typeof value === 'object';
-                });
-                counts.method2 = cacheEntries.length;
+                // Get a fresh estimate
+                const estimatedCount = await this.estimateCount();
                 
-                // Additional graph analysis
-                const graphAnalysis = {
-                    total_nodes: Object.keys(graph).length,
-                    cache_prefix_nodes: cacheEntries.length,
-                    root_cache_node: graph['cache'] ? 1 : 0,
-                    null_nodes: Object.values(graph).filter(v => v === null).length,
-                    non_object_nodes: Object.values(graph).filter(v => v !== null && typeof v !== 'object').length
-                };
-                counts.timing.method2 = Date.now() - startMethod2;
-
-                // Method 3: Node validation with detailed counting
-                const startMethod3 = Date.now();
-                const validation = {
-                    total_processed: 0,
-                    invalid_structure: 0,
-                    missing_required_fields: 0,
-                    valid_entries: 0
-                };
+                // Use direct graph access for simple metrics
+                const graph = this.gun._.graph || {};
+                const totalKeys = Object.keys(graph).length;
+                const cacheKeys = Object.keys(graph).filter(key => key.startsWith('cache/')).length;
                 
-                await new Promise((resolve) => {
-                    let processed = new Set();
-                    this.cacheTable.map().once((data, key) => {
-                        validation.total_processed++;
-                        
-                        if (!processed.has(key) && data !== null) {
-                            // Basic structure check
-                            if (!data || typeof data !== 'object') {
-                                validation.invalid_structure++;
-                                return;
-                            }
-                            
-                            // Check for required fields
-                            if (!data.encryptedData && !data.services && !data.infohash) {
-                                validation.missing_required_fields++;
-                                return;
-                            }
-                            
-                            counts.method3++;
-                            validation.valid_entries++;
-                            processed.add(key);
-                        }
-                    });
-                    
-                    // Force resolution after 3 seconds
-                    setTimeout(resolve, 3000);
-                });
-                counts.timing.method3 = Date.now() - startMethod3;
-
-                // Enhanced diagnostics
-                const diagnostics = {
-                    gun_stats: {
-                        graph_size: Object.keys(graph).length,
-                        graph_keys: Object.keys(graph).slice(0, 5),
-                        graph_analysis: graphAnalysis
-                    },
-                    cache_table: {
-                        exists: !!this.cacheTable,
-                        path: this.cacheTable ? this.cacheTable._.path : null
-                    },
-                    radisk: {
-                        enabled: this.gun._.opt.radisk,
-                        file: this.gun._.opt.file
-                    },
-                    validation_details: validation
-                };
-
+                // Get update stats
+                const updateStats = this.dataUpdateTracking ? {
+                    total_updates: this.dataUpdateTracking.totalUpdates,
+                    unique_nodes: this.dataUpdateTracking.uniqueNodes.size,
+                    last_update_age_ms: Date.now() - this.dataUpdateTracking.lastReceived
+                } : null;
+                
                 res.json({
-                    counts,
-                    diagnostics,
+                    estimates: {
+                        count: estimatedCount,
+                        total_graph_size: totalKeys,
+                        cache_keys: cacheKeys
+                    },
+                    updates: updateStats,
                     timestamp: new Date().toISOString()
                 });
-
             } catch (error) {
                 console.error('Error in test-count endpoint:', error);
                 res.status(500).json({ 
                     error: 'Internal server error',
-                    details: error.message,
-                    partial_counts: counts
+                    details: error.message
                 });
             }
         });
@@ -634,40 +532,49 @@ class GunNode {
                 console.log(`Node running on port ${port}`);
             });
 
-            // Initialize Gun with basic configuration
+            // Initialize Gun with streamlined configuration
             this.gun = Gun({
                 web: server,
                 peers: this.config.peers,
-                file: 'phalanx-db.json',  // File storage location
-                radisk: true,             // Enable RAD storage
-                localStorage: false,       // Disable localStorage in Node.js
-                multicast: false,         // Disable multicast for better performance
+                file: 'phalanx-db.json',
+                radisk: true,
+                localStorage: false,
+                multicast: false,
                 retry: 2000,
                 pid: NODE_ID,
                 super: this.config.isRemoteServer,
                 sea: true,
-                axe: false,
-                rtcConfig: {
-                    iceServers: [
-                        { urls: 'stun:stun.l.google.com:19302' },
-                        { urls: 'stun1.l.google.com:19302' },
-                        { urls: 'stun2.l.google.com:19302' },
-                        {
-                            urls: 'turn:openrelay.metered.ca:443',
-                            username: 'openrelayproject',
-                            credential: 'openrelayproject'
-                        }
-                    ]
-                }
+                axe: false
             });
 
             // Initialize the cache table
             this.cacheTable = this.gun.get('cache');
-
-            // Get initial count
-            console.log('Getting initial database count...');
-            this.startupCount = await this.getStartupCount();
-            console.log(`Initial database count: ${this.startupCount}`);
+            
+            // Setup minimal data update tracking
+            this.dataUpdateTracking = {
+                lastReceived: Date.now(),
+                totalUpdates: 0,
+                uniqueNodes: new Set(),
+                errorCount: 0
+            };
+            
+            // Set up a lightweight subscription for updates
+            this.updateSubscription = this.subscribeToLightUpdates();
+            
+            // Get an approximate count asynchronously without blocking startup
+            this.estimateCount().then(count => {
+                this.estimatedCount = count;
+                console.log(`Estimated database count: ~${count} entries`);
+            }).catch(err => {
+                console.warn('Error estimating count:', err);
+                this.estimatedCount = 0;
+            });
+            
+            // Set up periodic data gathering
+            this.setupPeriodicDataGathering();
+            
+            // Set up periodic connection trimming
+            this.setupConnectionTrimming();
             
             console.log('Node initialized successfully');
             return true;
@@ -675,6 +582,288 @@ class GunNode {
             console.error('Failed to initialize node:', error);
             return false;
         }
+    }
+    
+    // Set up periodic data gathering to continue discovering entries
+    setupPeriodicDataGathering() {
+        // Initial delay before starting periodic gathering (configurable, default 5 minutes)
+        const initialDelayMinutes = this.config.initialDelayMinutes || 5;
+        const initialDelay = initialDelayMinutes * 60 * 1000;
+        
+        // Interval between gathering attempts (from config, default 15 minutes)
+        const gatheringIntervalMinutes = this.config.gatheringIntervalMinutes || 15;
+        const gatheringInterval = gatheringIntervalMinutes * 60 * 1000;
+        
+        // Set initial state for tracking
+        this.lastGatheringTime = null;
+        this.nextGatheringTime = Date.now() + initialDelay;
+        this.totalGatheringEntries = 0;
+        
+        // Initialize as active immediately
+        this.dataGatheringActive = true;
+        
+        // Set up periodic gathering with initial delay
+        setTimeout(() => {
+            console.log(`Starting periodic data gathering (every ${gatheringIntervalMinutes} minutes)...`);
+            
+            // Run the first gathering
+            this.gatherMoreData();
+            
+            // Set up interval for subsequent gatherings
+            this.dataGatheringInterval = setInterval(() => {
+                this.gatherMoreData();
+            }, gatheringInterval);
+            
+        }, initialDelay);
+        
+        console.log(`Periodic data gathering scheduled to start in ${initialDelay/1000} seconds`);
+        console.log(`Gathering interval set to ${gatheringIntervalMinutes} minutes`);
+        
+        // Option to run immediately if interval is very small
+        if (gatheringIntervalMinutes <= 2) {
+            console.log('Interval is very small, running first gathering cycle immediately...');
+            setTimeout(() => this.gatherMoreData(), 5000); // Start after 5 seconds
+        }
+    }
+    
+    // Gather more data by sampling the network
+    async gatherMoreData() {
+        if (!this.gun) {
+            console.warn('Cannot gather data: Gun not initialized');
+            return;
+        }
+        
+        console.log('Starting data gathering cycle...');
+        
+        // Update gathering time tracking
+        this.lastGatheringTime = Date.now();
+        const gatheringIntervalMinutes = this.config.gatheringIntervalMinutes || 15;
+        this.nextGatheringTime = Date.now() + (gatheringIntervalMinutes * 60 * 1000); // Schedule next run
+        
+        try {
+            // Get current count
+            const beforeCount = await this.estimateCount();
+            
+            // Sample more data from the network
+            const samplePromise = new Promise(resolve => {
+                const alreadySeen = new Set();
+                let newEntriesFound = 0;
+                const maxSampleTime = 60 * 1000; // 60 seconds max
+                
+                // Create a temporary subscription that will be cleaned up
+                let mapSubscription = null;
+                
+                // Sample from cache table
+                mapSubscription = this.cacheTable.map().on((data, key) => {
+                    if (data && key !== 'cache' && !alreadySeen.has(key)) {
+                        alreadySeen.add(key);
+                        newEntriesFound++;
+                        
+                        // Log progress sparingly
+                        if (newEntriesFound % 50 === 0) {
+                            console.log(`Data gathering found ${newEntriesFound} entries so far...`);
+                        }
+                    }
+                });
+                
+                // Set a timeout to end sampling and clean up the subscription
+                setTimeout(() => {
+                    if (mapSubscription) {
+                        this.cacheTable.map().off();
+                        mapSubscription = null;
+                    }
+                    resolve(newEntriesFound);
+                }, maxSampleTime);
+            });
+            
+            // Wait for the sampling to complete
+            const newEntriesFound = await samplePromise;
+            
+            // Get updated count
+            const afterCount = await this.estimateCount();
+            const increase = afterCount - beforeCount;
+            
+            // Update tracking metrics
+            this.totalGatheringEntries = (this.totalGatheringEntries || 0) + newEntriesFound;
+            
+            console.log(`Data gathering cycle completed: found ${newEntriesFound} entries, count increased by ${increase} (${beforeCount} → ${afterCount})`);
+            
+            // Update the estimated count
+            this.estimatedCount = afterCount;
+            
+            // After gathering data, run a connection trim to clean up
+            this.trimActiveConnections();
+        } catch (error) {
+            console.error('Error during data gathering cycle:', error);
+        }
+    }
+    
+    // Cleanup method to stop intervals when shutting down
+    cleanup() {
+        console.log('Cleaning up resources...');
+        
+        // Clear data gathering interval if it exists
+        if (this.dataGatheringInterval) {
+            clearInterval(this.dataGatheringInterval);
+            this.dataGatheringInterval = null;
+            this.dataGatheringActive = false;
+            console.log('Stopped periodic data gathering');
+        }
+        
+        // Clear connection trimming interval if it exists
+        if (this.trimConnectionInterval) {
+            clearInterval(this.trimConnectionInterval);
+            this.trimConnectionInterval = null;
+            console.log('Stopped periodic connection trimming');
+        }
+        
+        // Unsubscribe from updates if subscription exists
+        if (this.updateSubscription) {
+            this.updateSubscription.unsubscribe();
+            this.updateSubscription = null;
+            console.log('Unsubscribed from data updates');
+        }
+        
+        // Force call off() on cache table to release all connections
+        if (this.cacheTable) {
+            this.cacheTable.map().off();
+            console.log('Released all persistent connections to cache table');
+        }
+        
+        console.log('Cleanup completed');
+    }
+    
+    // Lightweight subscription method that just listens for updates without heavy processing
+    subscribeToLightUpdates() {
+        if (!this.gun) {
+            console.warn('Gun not initialized');
+            return null;
+        }
+        
+        console.log('Setting up lightweight data update listener');
+        
+        // Track when nodes were last processed to avoid duplicates
+        const processedNodes = new Map();
+        const throttleTime = 10000; // 10 seconds throttle
+        let activeListener = null;
+        
+        // Use a more targeted approach to listen for updates
+        // Instead of listening to all keys with map(), listen to specific soul
+        const updateCallback = (data, key) => {
+            // Skip null data or cache root
+            if (!data || key === 'cache') return;
+            
+            // Basic throttling
+            const now = Date.now();
+            const lastTime = processedNodes.get(key) || 0;
+            if (now - lastTime < throttleTime) return;
+            
+            // Update tracking
+            processedNodes.set(key, now);
+            this.dataUpdateTracking.lastReceived = now;
+            this.dataUpdateTracking.totalUpdates++;
+            this.dataUpdateTracking.uniqueNodes.add(key);
+            
+            // Log updates very sparingly
+            if (this.dataUpdateTracking.totalUpdates % 100 === 0) {
+                console.log(`Received ~${this.dataUpdateTracking.totalUpdates} updates`);
+                
+                // Periodically clean up the processedNodes map to prevent memory leaks
+                if (processedNodes.size > 10000) {
+                    console.log(`Cleaning up processed nodes tracking (${processedNodes.size} entries)`);
+                    // Keep only recent entries (last 5 minutes)
+                    const cutoffTime = now - (5 * 60 * 1000);
+                    for (const [nodeKey, timestamp] of processedNodes.entries()) {
+                        if (timestamp < cutoffTime) {
+                            processedNodes.delete(nodeKey);
+                        }
+                    }
+                    console.log(`After cleanup: ${processedNodes.size} entries remain`);
+                }
+            }
+        };
+        
+        // Set up the listener - instead of using map().on which creates many listeners,
+        // use a single targeted listener on the cache table
+        activeListener = this.cacheTable.on(updateCallback);
+        
+        // Return an object with an unsubscribe method to clean up properly
+        return {
+            unsubscribe: () => {
+                if (activeListener) {
+                    this.cacheTable.off(updateCallback);
+                    activeListener = null;
+                    console.log('Unsubscribed from data updates');
+                }
+                
+                // Clear the processed nodes to free memory
+                processedNodes.clear();
+            }
+        };
+    }
+    
+    // Get a quick estimate of the database size
+    async estimateCount() {
+        return new Promise((resolve) => {
+            // Use direct graph access for faster estimation
+            const graph = this.gun._.graph || {};
+            const cacheEntries = Object.keys(graph).filter(key => 
+                key.startsWith('cache/') && key !== 'cache'
+            ).length;
+            
+            // If we have entries from the graph, use that as it's fastest
+            if (cacheEntries > 0) {
+                resolve(cacheEntries);
+                return;
+            }
+            
+            // Fall back to sampling with a timeout
+            let count = 0;
+            let sampleSize = 0;
+            const maxSamples = 1000;
+            let mapSubscription = null;
+            
+            // Set up a promise that will resolve after a timeout
+            const timeoutPromise = new Promise(resolve => {
+                setTimeout(() => resolve('timeout'), 3000);
+            });
+            
+            // Set up the sampling promise
+            const samplingPromise = new Promise(resolve => {
+                // Use a throttled approach to reduce memory pressure
+                mapSubscription = this.cacheTable.map().on((data, key) => {
+                    if (data && key !== 'cache') {
+                        count++;
+                    }
+                    sampleSize++;
+                    
+                    // If we've sampled enough, resolve
+                    if (sampleSize >= maxSamples) {
+                        resolve('complete');
+                    }
+                });
+            });
+            
+            // Race between timeout and sampling
+            Promise.race([timeoutPromise, samplingPromise])
+                .then((result) => {
+                    // Clean up subscription, regardless of which promise resolved
+                    if (mapSubscription) {
+                        this.cacheTable.map().off();
+                        mapSubscription = null;
+                    }
+                    resolve(count);
+                })
+                .catch(err => {
+                    console.error('Error during count estimation:', err);
+                    // Ensure cleanup happens even on error
+                    if (mapSubscription) {
+                        this.cacheTable.map().off();
+                        mapSubscription = null;
+                    }
+                    resolve(0);
+                });
+        });
     }
 
     // Initialize SEA encryption
@@ -1444,30 +1633,90 @@ class GunNode {
         }
     }
 
-    async getStartupCount() {
-        return new Promise((resolve) => {
-            let count = 0;
-            let seen = new Set();
-            let completed = false;
-
-            console.log('Starting initial database count...');
-
-            this.cacheTable.map().on((data, key) => {
-                if (!seen.has(key) && data !== null && data !== undefined) {
-                    count++;
-                    seen.add(key);
+    // Set up periodic connection trimming to prevent too many active connections
+    setupConnectionTrimming() {
+        const trimIntervalMinutes = this.config.connectionTrimIntervalMinutes || 5;
+        const trimInterval = trimIntervalMinutes * 60 * 1000;
+        
+        console.log(`Setting up connection trimming every ${trimIntervalMinutes} minutes`);
+        
+        // Run connection trimming periodically
+        this.trimConnectionInterval = setInterval(() => {
+            this.trimActiveConnections();
+        }, trimInterval);
+        
+        // Run an initial trim after 30 seconds to handle any startup connections
+        setTimeout(() => {
+            this.trimActiveConnections();
+        }, 30000);
+    }
+    
+    // Trim active connections to prevent memory issues and "too many GETs" warnings
+    trimActiveConnections() {
+        if (!this.gun) {
+            console.warn('Cannot trim connections: Gun not initialized');
+            return;
+        }
+        
+        try {
+            console.log('Starting connection trimming cycle...');
+            
+            // Get the Gun internal graph
+            const graph = this.gun._.graph || {};
+            
+            // Get all active connections from Gun's internal state
+            let liveConnections = 0;
+            let trimmedConnections = 0;
+            
+            // Find all nodes with active GETs
+            if (this.gun.back && this.gun.back('opt.peers')) {
+                // Log peer connections
+                const peers = this.gun.back('opt.peers');
+                console.log(`Active peer connections: ${Object.keys(peers).length}`);
+            }
+            
+            // Check for active connections in the graph
+            try {
+                // Count active listeners by iterating through the graph state
+                Object.keys(graph).forEach(key => {
+                    const node = graph[key];
+                    if (node && node._ && node._['>']) {
+                        // Has listeners (GETs)
+                        liveConnections++;
+                    }
+                });
+                
+                console.log(`Found ${liveConnections} active GET connections`);
+                
+                // If we have too many connections, perform a targeted cleanup
+                const maxConnections = this.config.maxActiveConnections || 2000;
+                if (liveConnections > maxConnections) {
+                    console.log(`Too many active connections (${liveConnections}), trimming...`);
+                    
+                    // Perform cleanup by turning off cached listeners
+                    // First release any map listeners on the cache table
+                    this.cacheTable.map().off();
+                    
+                    // Reset our update subscription to maintain essential functionality
+                    if (this.updateSubscription) {
+                        this.updateSubscription.unsubscribe();
+                        this.updateSubscription = this.subscribeToLightUpdates();
+                    }
+                    
+                    // Log the cleanup action
+                    console.log(`Released map listeners to reduce connection count`);
+                    trimmedConnections = liveConnections;
+                } else {
+                    console.log(`Connection count (${liveConnections}) is under limit, no trimming needed`);
                 }
-            });
-
-            // Force resolution after 10 seconds to ensure we get a good initial count
-            setTimeout(() => {
-                if (!completed) {
-                    completed = true;
-                    console.log(`Initial count completed: ${count} entries found`);
-                    resolve(count);
-                }
-            }, 10000);
-        });
+            } catch (err) {
+                console.error('Error accessing Gun internal state:', err);
+            }
+            
+            console.log(`Connection trimming completed: ${trimmedConnections} connections released`);
+        } catch (error) {
+            console.error('Error during connection trimming:', error);
+        }
     }
 }
 
@@ -1475,12 +1724,20 @@ class GunNode {
 const args = process.argv.slice(2);
 const nodeType = args[0] || 'local';  // Default to local if no argument
 const port = args[1] || 8888;  // Optional port argument
+const gatheringInterval = args[2] ? parseInt(args[2]) : 15;  // Optional gathering interval in minutes, default 15
+const initialDelay = args[3] ? parseInt(args[3]) : 5;  // Optional initial delay in minutes, default 5
+const connectionTrimInterval = args[4] ? parseInt(args[4]) : 5; // Optional connection trim interval in minutes, default 5
+const maxConnections = args[5] ? parseInt(args[5]) : 2000; // Optional max connections parameter, default 2000
 
 // Configure node based on type
 const config = {
     isRemoteServer: nodeType === 'remote',
     connectToRemote: nodeType === 'local',
-    port: parseInt(port)
+    port: parseInt(port),
+    gatheringIntervalMinutes: gatheringInterval,
+    initialDelayMinutes: initialDelay,
+    connectionTrimIntervalMinutes: connectionTrimInterval,
+    maxActiveConnections: maxConnections
 };
 
 // Create and initialize node
@@ -1508,12 +1765,36 @@ const initializeRelays = async () => {
 
 initializeRelays();
 
+// Setup graceful shutdown handlers
+process.on('SIGINT', () => {
+    console.log('\nReceived SIGINT (Ctrl+C). Shutting down gracefully...');
+    node.cleanup();
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    console.log('\nReceived SIGTERM. Shutting down gracefully...');
+    node.cleanup();
+    process.exit(0);
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught exception:', err);
+    node.cleanup();
+    process.exit(1);
+});
+
 // Log startup configuration
 console.log('\nNode Configuration:');
 console.log('==================');
 console.log(`Node ID: ${NODE_ID}`);
 console.log(`Mode: ${config.isRemoteServer ? 'Remote Server' : 'Local Client'}`);
 console.log(`Port: ${config.port}`);
+console.log(`Data Gathering Interval: ${config.gatheringIntervalMinutes} minutes`);
+console.log(`Initial Delay: ${config.initialDelayMinutes} minutes`);
+console.log(`Connection Trim Interval: ${config.connectionTrimIntervalMinutes} minutes`);
+console.log(`Max Active Connections: ${config.maxActiveConnections}`);
 console.log(`Peer Discovery: Enabled (using gun-relays)`);
 console.log('\nEncryption Configuration:');
 console.log('----------------------');
