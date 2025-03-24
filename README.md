@@ -6,7 +6,6 @@ A Node.js implementation with Express server integration built on Gun.JS. Phalan
 
 - Gun.js peer-to-peer database integration
 - Express server setup
-- Rate limiting for endpoints
 - Multi-service support: track the same infohash across different services
 - Cache management:
   - Two-state cache system: `cached` and `uncached`
@@ -53,49 +52,6 @@ curl -X POST http://localhost:8888/data \
 Note: All timestamps must be in UTC format (ISO 8601) with the 'Z' suffix indicating UTC timezone (e.g., "2024-03-12T12:00:00Z")
 
 Note: No actual expiration logic is applied - in otherwise once added data is static. Expiration date and time can be used by clients to determine whether or not to consider the data valid
-
-### Get All Data
-
-```bash
-curl http://localhost:8888/data \
-  -H "Authorization: Bearer TOKEN"
-```
-
-Example Response:
-```json
-{
-  "total": 2,
-  "limit": 50,
-  "data": [
-    {
-      "infohash": "example_hash_123",
-      "services": {
-        "real_debrid": {
-          "cached": true,
-          "last_modified": "2024-03-12T12:00:00Z",
-          "expiry": "2024-03-19T12:00:00Z"
-        },
-        "premiumize": {
-          "cached": false,
-          "last_modified": "2024-03-12T11:00:00Z",
-          "expiry": "2024-03-13T11:00:00Z"
-        }
-      }
-    },
-    {
-      "infohash": "another_hash_456",
-      "services": {
-        "torbox": {
-          "cached": true,
-          "last_modified": "2024-03-11T10:00:00Z",
-          "expiry": "2024-03-18T10:00:00Z"
-        }
-      }
-    }
-  ],
-  "schema_version": "2.0"
-}
-```
 
 ### Get Specific Data by Infohash
 

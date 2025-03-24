@@ -38,3 +38,5 @@ phalanx-db.json-cache*
 cache%*
 data.json
 phalanx-db.json
+bk.client.js
+data/phalanx-db/!

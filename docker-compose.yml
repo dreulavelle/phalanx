@@ -7,7 +7,7 @@ services:
       - "3000:3000"
     volumes:
       - phalanx_data:/app/gun-relays
-      - phalanx_data:/app/node-data.json
+      - phalanx_data:/app/data
 
 volumes:
   phalanx_data:
