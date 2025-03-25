@@ -26,14 +26,10 @@ class PhalanxMonitor {
         this.cacheTable = null;
         this.connectedRelays = [];
         this.startupTime = new Date();
-        this.seenEntries = 0; // Simple counter for entries processed
-        this.entryCount = 0; // New counter for received entries
+        this.lastUpdateTime = null; // Track timestamp of newest item seen
         this.pair = null; // Will store SEA key pair
-        this.serviceCounts = new Map(); // Track counts by service type
         this.memoryLoggingInterval = null;
         this.EXCLUDED_SERVICES = ['usenet', 'direct', 'torrent', 'web', 'test', '#']; // Services to exclude
-        this.processedEntries = new Set(); // Track processed entries to prevent duplicates
-        this.cleanupInterval = null; // Will hold the cleanup interval timer
 
         // Initialize Express app and server
         this.app = express();
@@ -48,7 +44,6 @@ class PhalanxMonitor {
         for (let key in used) {
             console.log(`${key}: ${Math.round(used[key] / 1024 / 1024 * 100) / 100} MB`);
         }
-        console.log('Total entries seen:', this.seenEntries);
         console.log('---------------------------------------------\n');
     }
 
@@ -296,16 +291,6 @@ class PhalanxMonitor {
             return;
         }
         
-        // Check if we've already processed this entry
-        if (this.processedEntries.has(key)) {
-            return; // Skip if already processed
-        }
-        this.processedEntries.add(key);
-        
-        // Increment the counters
-        this.seenEntries++;
-        this.entryCount++;
-        
         try {
             if (!data) {
                 return;
@@ -324,48 +309,22 @@ class PhalanxMonitor {
 
             // Use cleanData to parse the data
             const cleanedData = this.cleanData(decryptedData, key);
-            if (!cleanedData) {
+            if (!cleanedData || !cleanedData.services) {
                 return;
             }
 
-            // Extract services
-            const services = cleanedData.services;
-
-            // Update service counts
-            if (services && typeof services === 'object') {
-                Object.keys(services).forEach(serviceName => {
-                    if (!EXCLUDED_SERVICES.includes(serviceName)) {
-                        const count = this.serviceCounts.get(serviceName) || 0;
-                        this.serviceCounts.set(serviceName, count + 1);
+            // Check all services for the newest last_modified timestamp
+            Object.values(cleanedData.services).forEach(service => {
+                if (service.last_modified && this.isValidISODate(service.last_modified)) {
+                    if (!this.lastUpdateTime || new Date(service.last_modified) > new Date(this.lastUpdateTime)) {
+                        this.lastUpdateTime = service.last_modified;
                     }
-                });
-            }
-
-            // Log minimally
-            if (this.entryCount % 100 === 0) {
-                this.logMemoryUsage();
-                this.logServiceCounts();
-            }
+                }
+            });
 
         } catch (error) {
             console.error(`Error processing data for key ${key}:`, error);
         }
-    }
-
-    // Log counts of different services
-    logServiceCounts() {
-        console.log('\n----- SERVICE COUNTS -----');
-        if (this.serviceCounts.size === 0) {
-            console.log('No services tracked yet');
-        } else {
-            const sortedServices = Array.from(this.serviceCounts.entries())
-                .sort((a, b) => b[1] - a[1]); // Sort by count descending
-            
-            sortedServices.forEach(([service, count]) => {
-                console.log(`${service}: ${count} entries`);
-            });
-        }
-        console.log('------------------------\n');
     }
 
     // Get data with SEA decryption
@@ -420,6 +379,11 @@ class PhalanxMonitor {
             const lastModified = data.last_modified && this.isValidISODate(data.last_modified)
                 ? data.last_modified
                 : new Date().toISOString();
+
+            // Update lastUpdateTime if this is the newest item we've seen
+            if (!this.lastUpdateTime || new Date(lastModified) > new Date(this.lastUpdateTime)) {
+                this.lastUpdateTime = lastModified;
+            }
 
             // Calculate default expiry based on cached status
             let expiry;
@@ -578,12 +542,6 @@ class PhalanxMonitor {
         // Log final memory state
         this.logMemoryUsage();
         
-        // Clear processedEntries cleanup interval
-        if (this.cleanupInterval) {
-            clearInterval(this.cleanupInterval);
-            this.cleanupInterval = null;
-        }
-        
         console.log('Cleanup completed');
     }
 
@@ -676,10 +634,10 @@ class PhalanxMonitor {
         // Define the /debug endpoint
         this.app.get('/debug', authenticateRequest, (req, res) => {
             const memoryUsage = process.memoryUsage();
-            const serviceCounts = Array.from(this.serviceCounts.entries());
 
             res.json({
                 timestamp: new Date().toISOString(),
+                lastUpdate: this.lastUpdateTime || 'No updates yet',
                 memoryUsage: {
                     rss: `${(memoryUsage.rss / 1024 / 1024).toFixed(2)} MB`,
                     heapTotal: `${(memoryUsage.heapTotal / 1024 / 1024).toFixed(2)} MB`,
@@ -687,9 +645,6 @@ class PhalanxMonitor {
                     external: `${(memoryUsage.external / 1024 / 1024).toFixed(2)} MB`,
                     arrayBuffers: `${(memoryUsage.arrayBuffers / 1024 / 1024).toFixed(2)} MB`,
                 },
-                totalEntriesSeen: this.seenEntries,
-                totalEntryCount: this.entryCount,
-                serviceCounts: serviceCounts,
                 uptime: `${process.uptime().toFixed(2)} seconds`,
                 startupTime: this.startupTime.toISOString(),
                 connectedRelays: this.connectedRelays,
@@ -849,12 +804,6 @@ const monitor = new PhalanxMonitor();
 monitor.initialize().then(success => {
     if (success) {
         console.log('Monitor is running. Press Ctrl+C to exit.');
-        
-        // Setup periodic cleanup of processedEntries
-        monitor.cleanupInterval = setInterval(() => {
-            monitor.processedEntries.clear();
-            console.log('Cleared processedEntries Set to prevent memory bloat.');
-        }, 3600000); // Clear every hour
     } else {
         console.error('Failed to initialize monitor. Exiting.');
         process.exit(1);
